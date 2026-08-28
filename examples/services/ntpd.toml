@@ -1,0 +1,22 @@
+[service]
+description = "Network time synchronization daemon"
+command = "/usr/bin/chronyd"
+args = []
+user = "root"
+group = "root"
+working_dir = "/"
+
+[service.readiness]
+type = "pid"
+
+[service.restart]
+policy = "always"
+max_restarts = 10
+backoff_initial_ms = 1000
+backoff_max_ms = 30000
+backoff_multiplier = 2.0
+
+[service.shutdown]
+signal = "TERM"
+timeout_ms = 5000
+kill_signal = "KILL"

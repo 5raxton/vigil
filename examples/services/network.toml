@@ -1,0 +1,12 @@
+[service]
+description = "Network configuration"
+command = "/usr/bin/udhcpc"
+args = ["-i", "eth0"]
+user = "root"
+group = "root"
+
+[service.restart]
+policy = "on-failure"
+
+[logging]
+type = "pipe"

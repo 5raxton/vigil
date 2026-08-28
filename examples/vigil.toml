@@ -1,0 +1,7 @@
+service_dir = "/etc/vigil/services"
+target_dir = "/etc/vigil/targets"
+control_socket = "/run/vigil/control.sock"
+log_dir = "/var/log/vigil"
+runtime_dir = "/run/vigil"
+default_target = "default"
+hostname = "vigil-box"

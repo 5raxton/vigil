@@ -1,0 +1,18 @@
+[service]
+description = "System logging daemon"
+command = "/usr/bin/syslog-ng"
+args = []
+user = "root"
+group = "root"
+
+[service.readiness]
+type = "pid"
+
+[service.restart]
+policy = "always"
+
+[logging]
+type = "pipe"
+max_size_mb = 50
+max_files = 10
+timestamp = true

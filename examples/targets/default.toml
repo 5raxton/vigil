@@ -1,0 +1,10 @@
+[target]
+description = "Default multi-user runlevel"
+requires = []
+
+[services]
+"syslog" = { enabled = true }
+"ntpd" = { enabled = true }
+"sshd" = { enabled = true }
+"dbus" = { enabled = true, optional = true }
+"network" = { enabled = true }

@@ -1,0 +1,36 @@
+[service]
+description = "Secure shell daemon"
+command = "/usr/bin/sshd"
+args = ["-D"]
+user = "root"
+group = "root"
+
+[service.readiness]
+type = "socket"
+
+[service.restart]
+policy = "on-failure"
+max_restarts = 5
+
+[logging]
+type = "pipe"
+max_size_mb = 20
+max_files = 5
+timestamp = true
+
+[[dependencies]]
+service = "ntpd"
+type = "after"
+required = true
+
+[[dependencies]]
+service = "dbus"
+type = "wants"
+required = false
+
+[socket]
+listen = ["tcp:22"]
+
+[service.environment]
+LANG = "C.UTF-8"
+SSHD_CONFIG = "/etc/ssh/sshd_config"
