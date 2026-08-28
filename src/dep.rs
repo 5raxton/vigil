@@ -1,5 +1,6 @@
 use crate::config::{DependencyConfig, DependencyType};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct DepGraph {
@@ -101,22 +102,22 @@ impl DepGraph {
             }
         }
 
-        let mut queue: VecDeque<String> = VecDeque::new();
+        let mut queue: BinaryHeap<Reverse<String>> = BinaryHeap::new();
         for (svc, &degree) in &in_degree {
             if degree == 0 {
-                queue.push_back(svc.clone());
+                queue.push(Reverse(svc.clone()));
             }
         }
 
         let mut sorted = Vec::new();
-        while let Some(svc) = queue.pop_front() {
+        while let Some(Reverse(svc)) = queue.pop() {
             sorted.push(svc.clone());
             if let Some(deps) = adj.get(&svc) {
                 for dep in deps {
                     let degree = in_degree.get_mut(dep).unwrap();
                     *degree -= 1;
                     if *degree == 0 {
-                        queue.push_back(dep.clone());
+                        queue.push(Reverse(dep.clone()));
                     }
                 }
             }
@@ -149,6 +150,22 @@ mod tests {
         }
     }
 
+    fn dep_before(service: &str) -> DependencyConfig {
+        DependencyConfig {
+            service: service.to_string(),
+            kind: DependencyType::Before,
+            required: true,
+        }
+    }
+
+    fn dep_wants(service: &str) -> DependencyConfig {
+        DependencyConfig {
+            service: service.to_string(),
+            kind: DependencyType::Wants,
+            required: false,
+        }
+    }
+
     #[test]
     fn test_simple_order() {
         let mut graph = DepGraph::new();
@@ -171,5 +188,86 @@ mod tests {
         graph.add_dependency("b", &dep_after("a"));
 
         assert!(graph.resolve_order(&["a".into(), "b".into()]).is_err());
+    }
+
+    #[test]
+    fn test_before_dependency() {
+        let mut graph = DepGraph::new();
+        graph.add_service("a".into());
+        graph.add_service("b".into());
+        graph.add_dependency("a", &dep_before("b"));
+
+        let order = graph
+            .resolve_order(&["a".into(), "b".into()])
+            .unwrap();
+        assert_eq!(order, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_chain_propagates_to_leaf() {
+        let mut graph = DepGraph::new();
+        for s in ["a", "b", "c", "d"] {
+            graph.add_service(s.into());
+        }
+        graph.add_dependency("b", &dep_after("a"));
+        graph.add_dependency("c", &dep_after("b"));
+        graph.add_dependency("d", &dep_after("c"));
+
+        let order = graph
+            .resolve_order(&["a".into(), "b".into(), "c".into(), "d".into()])
+            .unwrap();
+        assert_eq!(order, vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn test_order_is_deterministic() {
+        let mut graph = DepGraph::new();
+        for s in ["a", "b", "c", "d", "e", "f"] {
+            graph.add_service(s.into());
+        }
+        graph.add_dependency("d", &dep_after("b"));
+        graph.add_dependency("e", &dep_after("b"));
+        graph.add_dependency("f", &dep_after("c"));
+
+        let input = vec![
+            "d".into(),
+            "b".into(),
+            "f".into(),
+            "c".into(),
+            "e".into(),
+            "a".into(),
+        ];
+        let first = graph.resolve_order(&input).unwrap();
+        let second = graph.resolve_order(&input).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn test_missing_required_only_for_known_services() {
+        let mut graph = DepGraph::new();
+        graph.add_service("a".into());
+        graph.add_dependency("a", &dep_after("ghost"));
+
+        let available: HashSet<String> = ["a".into()].into_iter().collect();
+        let missing = graph.get_missing_required(&available);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0], ("a".to_string(), "ghost".to_string()));
+    }
+
+    #[test]
+    fn test_wants_are_recorded_but_ordering_neutral() {
+        let mut graph = DepGraph::new();
+        graph.add_service("a".into());
+        graph.add_service("b".into());
+        graph.add_service("c".into());
+        graph.add_dependency("a", &dep_wants("b"));
+        graph.add_dependency("b", &dep_after("c"));
+
+        assert_eq!(graph.get_wanted_services("a"), vec!["b".to_string()]);
+
+        let order = graph
+            .resolve_order(&["a".into(), "b".into(), "c".into()])
+            .unwrap();
+        assert!(order.iter().position(|s| s == "c").unwrap() < order.iter().position(|s| s == "b").unwrap());
     }
 }

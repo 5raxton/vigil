@@ -2,17 +2,17 @@ use anyhow::{Context, Result};
 use nix::sys::resource::{setrlimit, Resource};
 use nix::sys::signal::Signal;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{chdir, fork, ForkResult, Gid, Pid, Uid};
+use nix::unistd::{chdir, execvp, fork, ForkResult, Gid, Pid, Uid};
 use std::env;
 use std::ffi::CString;
 use std::fs;
 use std::io::Write;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::time::{Duration, Instant};
 
 use vigil::config::{LogType, OutputTarget, RestartPolicy, ServiceConfig};
+use vigil::{VIGIL_LOG_DIR, VIGIL_SUPERVISE_DIR};
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -28,7 +28,7 @@ fn main() -> Result<()> {
     let default_log_dir = args
         .get(3)
         .map(|s| s.as_str())
-        .unwrap_or("/var/log/vigil");
+        .unwrap_or(VIGIL_LOG_DIR);
 
     let config_content = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read config: {}", config_path))?;
@@ -36,7 +36,8 @@ fn main() -> Result<()> {
         toml::from_str(&config_content).with_context(|| "failed to parse config")?;
 
     let supervise_dir = PathBuf::from(format!(
-        "/run/vigil/supervise/{}",
+        "{}/{}",
+        VIGIL_SUPERVISE_DIR,
         service_name
     ));
     fs::create_dir_all(&supervise_dir)?;
@@ -66,7 +67,7 @@ fn main() -> Result<()> {
             );
         }
 
-        let service_log = open_service_log(&config, &log_path);
+        let (log_read, log_write) = create_log_pipe(&config, service_name);
 
         writeln_state(&status_dir, "starting", None)?;
         eprintln!("vigil-supervise [{}]: starting service", service_name);
@@ -74,7 +75,12 @@ fn main() -> Result<()> {
         let child_pid = match unsafe { fork() } {
             Ok(ForkResult::Parent { child }) => child,
             Ok(ForkResult::Child) => {
-                run_service_child(service_name, &config, service_log);
+                if log_read >= 0 {
+                    unsafe {
+                        libc::close(log_read);
+                    }
+                }
+                run_service_child(service_name, &config, log_write);
                 exit(127);
             }
             Err(e) => {
@@ -87,6 +93,30 @@ fn main() -> Result<()> {
             }
         };
 
+        let parent_write = log_write;
+        if parent_write >= 0 {
+            unsafe {
+                libc::close(parent_write);
+            }
+        }
+
+        let vigillog_pid = if log_read >= 0 {
+            Some(spawn_vigillog(
+                service_name,
+                &log_path,
+                &config,
+                log_read,
+            ))
+        } else {
+            None
+        };
+
+        if log_read >= 0 {
+            unsafe {
+                libc::close(log_read);
+            }
+        }
+
         let service_pgid = child_pid.as_raw();
 
         writeln_state(&status_dir, "running", Some(child_pid.as_raw() as u32))?;
@@ -95,7 +125,7 @@ fn main() -> Result<()> {
             service_name, child_pid.as_raw(), service_pgid
         );
 
-        let outcome = supervise_child(service_name, &config, child_pid);
+        let outcome = supervise_child(service_name, &config, child_pid, vigillog_pid);
 
         match outcome {
             ChildOutcome::StoppedCleanly(code, signal) => {
@@ -105,12 +135,9 @@ fn main() -> Result<()> {
                     RestartPolicy::Never => false,
                     RestartPolicy::Always => true,
                     RestartPolicy::OnFailure => {
-                        code.map(|c| c != 0)
-                            .unwrap_or(signal.is_none())
+                        !matches!((code, signal), (Some(0), None))
                     }
-                    RestartPolicy::OnAbnormal => {
-                        signal.is_some()
-                    }
+                    RestartPolicy::OnAbnormal => signal.is_some(),
                 };
 
                 if !should_restart {
@@ -136,10 +163,14 @@ fn main() -> Result<()> {
                 run_finish_script(service_name, &config, &log_path);
 
                 restart_count += 1;
-                if last_restart.elapsed() >= Duration::from_secs(600) && restart_count > 1 {
+                if last_restart.elapsed() >= Duration::from_secs(600)
+                    && restart_count > 1
+                {
                     restart_count = 1;
+                    current_backoff = config.service.restart.backoff_initial_ms;
                 }
                 last_restart = Instant::now();
+                save_restart_count(&status_dir, restart_count);
 
                 eprintln!(
                     "vigil-supervise [{}]: restarting in {}ms (attempt {}/{})",
@@ -175,6 +206,14 @@ fn main() -> Result<()> {
 enum ChildOutcome {
     StoppedCleanly(Option<i32>, Option<Signal>),
     StopRequested,
+}
+
+fn reset_signal_mask() {
+    let mut empty: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut empty);
+        libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
+    }
 }
 
 fn block_stop_signals() -> Result<()> {
@@ -213,6 +252,7 @@ fn supervise_child(
     service_name: &str,
     config: &ServiceConfig,
     child_pid: Pid,
+    vigillog_pid: Option<Pid>,
 ) -> ChildOutcome {
     let sigset: libc::sigset_t = unsafe {
         let mut s = std::mem::zeroed();
@@ -225,20 +265,25 @@ fn supervise_child(
     };
 
     let timeout = Duration::from_millis(200);
+    let mut vigillog_pid = vigillog_pid;
 
     loop {
         match waitpid(child_pid, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::Exited(_, code)) => {
+                reap_vigillog(vigillog_pid);
                 return ChildOutcome::StoppedCleanly(Some(code), None);
             }
             Ok(WaitStatus::Signaled(_, sig, _)) => {
+                reap_vigillog(vigillog_pid);
                 return ChildOutcome::StoppedCleanly(None, Some(sig));
             }
             Ok(WaitStatus::StillAlive) | Ok(WaitStatus::Stopped(_, _)) => {}
             Ok(_) => {
+                reap_vigillog(vigillog_pid);
                 return ChildOutcome::StoppedCleanly(None, None);
             }
             Err(nix::errno::Errno::ECHILD) => {
+                reap_vigillog(vigillog_pid);
                 return ChildOutcome::StoppedCleanly(None, None);
             }
             Err(e) => {
@@ -246,15 +291,33 @@ fn supervise_child(
                     "vigil-supervise [{}]: waitpid error: {}",
                     service_name, e
                 );
+                reap_vigillog(vigillog_pid);
                 return ChildOutcome::StoppedCleanly(None, None);
+            }
+        }
+
+        if let Some(vp) = vigillog_pid {
+            match waitpid(vp, Some(WaitPidFlag::WNOHANG)) {
+                Ok(WaitStatus::Exited(_, _)) | Ok(WaitStatus::Signaled(_, _, _)) => {
+                    vigillog_pid = None;
+                }
+                _ => {}
             }
         }
 
         match pop_signal_detail(&sigset).ok().flatten() {
             Some(libc::SIGTERM) | Some(libc::SIGINT) | Some(libc::SIGHUP) => {
                 let shutdown_signal = signal_from_name(&config.service.shutdown.signal);
+                let kill_signal = signal_from_name(&config.service.shutdown.kill_signal);
                 let grace = Duration::from_millis(config.service.shutdown.timeout_ms);
-                terminate_tree(child_pid.as_raw(), shutdown_signal, grace, service_name);
+                terminate_tree(
+                    child_pid.as_raw(),
+                    shutdown_signal,
+                    kill_signal,
+                    grace,
+                    service_name,
+                );
+                reap_vigillog(vigillog_pid);
                 return ChildOutcome::StopRequested;
             }
             Some(libc::SIGCHLD) => {
@@ -265,6 +328,24 @@ fn supervise_child(
         }
 
         std::thread::sleep(timeout);
+    }
+}
+
+fn reap_vigillog(pid: Option<Pid>) {
+    let Some(pid) = pid else { return };
+    let start = Instant::now();
+    loop {
+        match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => {}
+            Ok(_) => return,
+            Err(_) => return,
+        }
+        if start.elapsed() >= Duration::from_secs(2) {
+            let _ = nix::sys::signal::kill(pid, Signal::SIGKILL);
+            let _ = waitpid(pid, None);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -280,7 +361,7 @@ fn sleep_interruptible(duration: Duration, status_dir: &Path) -> Result<()> {
     };
 
     let mut slept = Duration::ZERO;
-    while slept < duration {
+    loop {
         match pop_signal_detail(&sigset) {
             Ok(Some(libc::SIGTERM)) | Ok(Some(libc::SIGINT)) | Ok(Some(libc::SIGHUP)) => {
                 eprintln!("vigil-supervise: stop during restart backoff");
@@ -289,13 +370,22 @@ fn sleep_interruptible(duration: Duration, status_dir: &Path) -> Result<()> {
             }
             _ => {}
         }
+        if slept >= duration {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(50));
         slept += Duration::from_millis(50);
     }
     Ok(())
 }
 
-fn terminate_tree(pgid: i32, signal: Signal, grace: Duration, service_name: &str) {
+fn terminate_tree(
+    pgid: i32,
+    signal: Signal,
+    kill_signal: Signal,
+    grace: Duration,
+    service_name: &str,
+) {
     let _ = nix::sys::signal::kill(Pid::from_raw(-pgid), signal);
 
     let start = Instant::now();
@@ -308,7 +398,7 @@ fn terminate_tree(pgid: i32, signal: Signal, grace: Duration, service_name: &str
                 "vigil-supervise [{}]: grace period elapsed, force-killing tree PGID {}",
                 service_name, pgid
             );
-            let _ = nix::sys::signal::kill(Pid::from_raw(-pgid), Signal::SIGKILL);
+            let _ = nix::sys::signal::kill(Pid::from_raw(-pgid), kill_signal);
             for _ in 0..40 {
                 if !process_group_alive(pgid) {
                     return;
@@ -340,12 +430,16 @@ fn describe_exit(code: Option<i32>, signal: Option<Signal>) -> String {
 
 fn signal_from_name(name: &str) -> Signal {
     match name {
+        "TERM" => Signal::SIGTERM,
+        "KILL" => Signal::SIGKILL,
+        "STOP" => Signal::SIGSTOP,
         "HUP" => Signal::SIGHUP,
         "INT" => Signal::SIGINT,
         "QUIT" => Signal::SIGQUIT,
         "USR1" => Signal::SIGUSR1,
         "USR2" => Signal::SIGUSR2,
         "ALRM" => Signal::SIGALRM,
+        "PIPE" => Signal::SIGPIPE,
         _ => Signal::SIGTERM,
     }
 }
@@ -357,32 +451,108 @@ fn resolve_log_path(config: &ServiceConfig, default_log_dir: &str, name: &str) -
     }
 }
 
-fn open_service_log(
-    config: &ServiceConfig,
-    log_path: &Path,
-) -> Option<(fs::File, fs::File)> {
+fn create_log_pipe(config: &ServiceConfig, service_name: &str) -> (i32, i32) {
     if config.logging.kind == LogType::None
         || (config.service.stdout == OutputTarget::Null
             && config.service.stderr == OutputTarget::Null)
+        || (config.service.stdout != OutputTarget::Log
+            && config.service.stderr != OutputTarget::Log)
     {
-        return None;
+        return (-1, -1);
     }
 
-    match fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path.join("current"))
-    {
-        Ok(f) => match f.try_clone() {
-            Ok(f2) => Some((f, f2)),
-            Err(_) => None,
-        },
+    let mut fds: [libc::c_int; 2] = [-1, -1];
+    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if rc != 0 {
+        eprintln!(
+            "vigil-supervise [{}]: failed to create log pipe",
+            service_name
+        );
+        return (-1, -1);
+    }
+    (fds[0], fds[1])
+}
+
+fn spawn_vigillog(
+    service_name: &str,
+    log_path: &Path,
+    config: &ServiceConfig,
+    log_read: i32,
+) -> Pid {
+    let leaf = log_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("service");
+    let parent = log_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("/var/log/vigil"));
+
+    match unsafe { fork() } {
+        Ok(ForkResult::Parent { child }) => child,
+        Ok(ForkResult::Child) => {
+            reset_signal_mask();
+
+            if log_read != 0 {
+                unsafe {
+                    libc::dup2(log_read, 0);
+                    libc::close(log_read);
+                }
+            }
+
+            let exe_path = std::env::current_exe().ok();
+            let name = CString::new("vigillog").unwrap();
+
+            let mut search_paths: Vec<String> = Vec::new();
+            if let Some(ref exe) = exe_path {
+                if let Some(dir) = exe.parent() {
+                    search_paths.push(dir.join("vigillog").to_string_lossy().to_string());
+                }
+            }
+            search_paths.extend(
+                ["/usr/local/bin", "/usr/bin", "/bin"]
+                    .iter()
+                    .map(|p| format!("{}/vigillog", p)),
+            );
+
+            let service_c = CString::new(leaf.to_string()).unwrap();
+            let log_dir_c = CString::new(parent.to_string_lossy().to_string()).unwrap();
+            let size_c = CString::new(config.logging.max_size_mb.to_string()).unwrap();
+            let files_c = CString::new(config.logging.max_files.to_string()).unwrap();
+            let ts_c = CString::new(if config.logging.timestamp { "1" } else { "0" }).unwrap();
+
+            for path in &search_paths {
+                if let Ok(c_path) = CString::new(path.as_str()) {
+                    if execvp(
+                        &c_path,
+                        &[
+                            name.clone(),
+                            service_c.clone(),
+                            log_dir_c.clone(),
+                            size_c.clone(),
+                            files_c.clone(),
+                            ts_c.clone(),
+                        ],
+                    )
+                    .is_ok()
+                    {
+                        unreachable!();
+                    }
+                }
+            }
+
+            eprintln!(
+                "vigil-supervise [{}]: failed to exec vigillog",
+                service_name
+            );
+            exit(1);
+        }
         Err(e) => {
             eprintln!(
-                "vigil-supervise [{}]: failed to open log: {}",
-                config.service.description, e
+                "vigil-supervise [{}]: failed to spawn vigillog: {}",
+                service_name, e
             );
-            None
+            exit(1);
         }
     }
 }
@@ -390,11 +560,13 @@ fn open_service_log(
 fn run_service_child(
     service_name: &str,
     config: &ServiceConfig,
-    service_log: Option<(fs::File, fs::File)>,
+    log_write: i32,
 ) {
     unsafe {
         libc::setpgid(0, 0);
     }
+
+    reset_signal_mask();
 
     if let Err(e) = prepare_service_environment(config) {
         eprintln!(
@@ -416,7 +588,13 @@ fn run_service_child(
         }
     }
 
-    dup_stdio(config, service_log);
+    dup_stdio(config, log_write);
+
+    if log_write > 2 {
+        unsafe {
+            libc::close(log_write);
+        }
+    }
 
     for (key, value) in &config.service.environment {
         env::set_var(key, value);
@@ -456,7 +634,7 @@ fn run_service_child(
 
 fn dup_stdio(
     config: &ServiceConfig,
-    service_log: Option<(fs::File, fs::File)>,
+    log_write: i32,
 ) {
     for (stream_fd, target) in [
         (1, &config.service.stdout),
@@ -464,25 +642,18 @@ fn dup_stdio(
     ] {
         match target {
             OutputTarget::Log => {
-                if let Some((ref out, ref err)) = service_log {
-                    let file = if stream_fd == 1 { out } else { err };
-                    let _ = nix::unistd::dup2(file.as_raw_fd(), stream_fd);
-                    continue;
+                if log_write >= 0 {
+                    let _ = nix::unistd::dup2(log_write, stream_fd);
+                } else {
+                    redirect_to_dev_null(stream_fd, libc::O_WRONLY);
                 }
-                redirect_to_dev_null(stream_fd, libc::O_WRONLY);
             }
             OutputTarget::Null => {
                 redirect_to_dev_null(stream_fd, libc::O_WRONLY);
             }
             OutputTarget::Stdout => {
                 if stream_fd == 2 {
-                    if let Some((ref out, _)) = service_log {
-                        let _ = nix::unistd::dup2(out.as_raw_fd(), 2);
-                    } else {
-                        redirect_to_dev_null(stream_fd, libc::O_WRONLY);
-                    }
-                } else {
-                    redirect_to_dev_null(stream_fd, libc::O_WRONLY);
+                    let _ = nix::unistd::dup2(1, 2);
                 }
             }
             OutputTarget::Syslog => {
@@ -544,6 +715,10 @@ fn writeln_state(status_dir: &Path, state: &str, pid: Option<u32>) -> Result<()>
     }
 
     Ok(())
+}
+
+fn save_restart_count(status_dir: &Path, count: u32) {
+    let _ = fs::write(status_dir.join("restarts"), count.to_string());
 }
 
 fn run_finish_script(

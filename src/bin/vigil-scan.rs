@@ -2,10 +2,9 @@ use anyhow::{Context, Result};
 use nix::sys::signal::Signal;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{execvp, fork, ForkResult, Pid};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CString;
 use std::fs;
-use std::io::BufRead;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -247,17 +246,57 @@ impl Scanner {
         );
 
         let available: HashSet<String> = self.services.keys().cloned().collect();
-        let mut to_enable: Vec<String> = Vec::new();
-        for name in &enabled {
-            for dep in &self.services[name].config.dependencies {
-                if dep.required && available.contains(&dep.service) && !self.services[&dep.service].enabled {
-                    to_enable.push(dep.service.clone());
+        let mut candidates: VecDeque<String> = self
+            .services
+            .iter()
+            .filter(|(_, s)| s.enabled)
+            .map(|(n, _)| n.clone())
+            .collect();
+
+        while let Some(name) = candidates.pop_front() {
+            let deps: Vec<(String, bool)> = self
+                .services
+                .get(&name)
+                .map(|s| {
+                    s.config
+                        .dependencies
+                        .iter()
+                        .map(|d| (d.service.clone(), d.required))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            for (dep, required) in deps {
+                if required && available.contains(&dep) {
+                    if let Some(state) = self.services.get_mut(&dep) {
+                        if !state.enabled {
+                            state.enabled = true;
+                            candidates.push_back(dep);
+                        }
+                    }
                 }
             }
         }
-        for dep in to_enable {
-            if let Some(s) = self.services.get_mut(&dep) {
-                s.enabled = true;
+
+        let enabled_services: Vec<String> = self
+            .services
+            .iter()
+            .filter(|(_, s)| s.enabled)
+            .map(|(n, _)| n.clone())
+            .collect();
+        for name in enabled_services {
+            for wanted in self.dep_graph.get_wanted_services(&name) {
+                let explicitly_disabled = target_services
+                    .get(&wanted)
+                    .map(|e| !e.enabled)
+                    .unwrap_or(false);
+                if !explicitly_disabled
+                    && available.contains(&wanted)
+                    && !self.services[&wanted].enabled
+                {
+                    self.services.get_mut(&wanted).unwrap().enabled = true;
+                    eprintln!("vigil-scan: enabling wanted service '{}'", wanted);
+                }
             }
         }
 
@@ -406,22 +445,19 @@ impl Scanner {
 
             let _ = nix::sys::signal::kill(nix_pid, Signal::SIGTERM);
 
-            loop {
-                match waitpid(nix_pid, Some(WaitPidFlag::WNOHANG)) {
-                    Ok(WaitStatus::StillAlive) => {
-                        if start.elapsed() >= grace {
-                            eprintln!(
-                                "vigil-scan: supervisor for '{}' (PID {}) did not exit; force killing",
-                                name, pid
-                            );
-                            let _ = nix::sys::signal::kill(nix_pid, Signal::SIGKILL);
-                            let _ = waitpid(nix_pid, None);
-                            break;
-                        }
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
-                    _ => break,
+            while let Ok(WaitStatus::StillAlive) =
+                waitpid(nix_pid, Some(WaitPidFlag::WNOHANG))
+            {
+                if start.elapsed() >= grace {
+                    eprintln!(
+                        "vigil-scan: supervisor for '{}' (PID {}) did not exit; force killing",
+                        name, pid
+                    );
+                    let _ = nix::sys::signal::kill(nix_pid, Signal::SIGKILL);
+                    let _ = waitpid(nix_pid, None);
+                    break;
                 }
+                std::thread::sleep(Duration::from_millis(50));
             }
 
             state.state = "stopped".into();
@@ -560,16 +596,47 @@ impl Scanner {
                 Ok(WaitStatus::StillAlive) => break,
                 Ok(WaitStatus::Exited(pid, _)) | Ok(WaitStatus::Signaled(pid, _, _)) => {
                     let pid_val = pid.as_raw() as u32;
-                    for (name, state) in self.services.iter_mut() {
-                        if state.supervisor_pid == Some(pid_val) {
-                            eprintln!(
-                                "vigil-scan: supervisor for '{}' (PID {}) terminated",
-                                name, pid_val
-                            );
+                    let name = self
+                        .services
+                        .iter()
+                        .find(|(_, s)| s.supervisor_pid == Some(pid_val))
+                        .map(|(n, _)| n.clone());
+
+                    if let Some(name) = name {
+                        eprintln!(
+                            "vigil-scan: supervisor for '{}' (PID {}) terminated",
+                            name, pid_val
+                        );
+                        let was_supervising = self.supervisor_was_live(&name);
+                        let mut respawn = false;
+                        if let Some(state) = self.services.get_mut(&name) {
                             state.supervisor_pid = None;
                             state.state = "stopped".into();
-                            state.restart_count = 0;
-                            break;
+                            if state.enabled
+                                && was_supervising
+                                && state.restart_count
+                                    < state.config.service.restart.max_restarts
+                            {
+                                state.restart_count += 1;
+                                respawn = true;
+                            } else {
+                                state.restart_count = 0;
+                            }
+                        }
+                        if respawn {
+                            eprintln!(
+                                "vigil-scan: respawning supervisor for '{}' (second chance)",
+                                name
+                            );
+                            if let Err(e) = self.start_service(&name) {
+                                eprintln!(
+                                    "vigil-scan: failed to respawn supervisor for '{}': {}",
+                                    name, e
+                                );
+                                if let Some(state) = self.services.get_mut(&name) {
+                                    state.restart_count = 0;
+                                }
+                            }
                         }
                     }
                 }
@@ -577,6 +644,23 @@ impl Scanner {
                 Err(nix::errno::Errno::ECHILD) => break,
                 Err(_) => break,
             }
+        }
+    }
+
+    fn supervisor_was_live(&self, name: &str) -> bool {
+        let path = self
+            .config
+            .runtime_dir
+            .join("supervise")
+            .join(name)
+            .join("status")
+            .join("state");
+        match fs::read_to_string(&path) {
+            Ok(s) => {
+                let s = s.trim();
+                s != "terminated" && s != "failed" && s != "stopped"
+            }
+            Err(_) => true,
         }
     }
 
@@ -593,7 +677,24 @@ impl Scanner {
             .and_then(|s| s.trim().parse::<u32>().ok())
     }
 
+    fn read_service_restarts(&self, name: &str) -> Option<u32> {
+        let path = self
+            .config
+            .runtime_dir
+            .join("supervise")
+            .join(name)
+            .join("status")
+            .join("restarts");
+        fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+    }
+
     fn handle_control_connection(&mut self, mut stream: UnixStream) {
+        let timeout = Duration::from_secs(15);
+        stream.set_read_timeout(Some(timeout)).ok();
+        stream.set_write_timeout(Some(timeout)).ok();
+
         let request: Request = match protocol::read_message(&mut stream) {
             Ok(r) => r,
             Err(e) => {
@@ -644,7 +745,9 @@ impl Scanner {
                                 .start_time
                                 .map(|t| t.elapsed().as_secs())
                                 .unwrap_or(0),
-                            restart_count: state.restart_count,
+                            restart_count: self
+                                .read_service_restarts(&name)
+                                .unwrap_or(state.restart_count),
                             description: state.config.service.description.clone(),
                             command: state.config.service.command.clone(),
                         })
@@ -729,7 +832,13 @@ impl Scanner {
             }
 
             Request::Log { service, lines } => {
-                let log_path = self.config.log_dir.join(&service).join("current");
+                let log_path = match self.services.get(&service) {
+                    Some(state) => match state.config.logging.path.as_ref() {
+                        Some(p) => p.join("current"),
+                        None => self.config.log_dir.join(&service).join("current"),
+                    },
+                    None => self.config.log_dir.join(&service).join("current"),
+                };
                 match read_log_lines(&log_path, lines) {
                     Ok(log_lines) => Response::LogLines(log_lines),
                     Err(e) => Response::Error {
@@ -801,6 +910,9 @@ impl Scanner {
             }
         }
 
+        let target = self.config.default_target.clone();
+        self.apply_target(&target)?;
+
         for (name, state) in self.services.iter_mut() {
             if let Some(old_state) = old_services.get(name) {
                 if old_state.state == "running" {
@@ -808,7 +920,28 @@ impl Scanner {
                     state.supervisor_pid = old_state.supervisor_pid;
                     state.restart_count = old_state.restart_count;
                     state.start_time = old_state.start_time;
+                    state.enabled = true;
                 }
+            }
+        }
+
+        let new_enabled: Vec<String> = self
+            .services
+            .iter()
+            .filter(|(n, s)| {
+                s.enabled
+                    && s.state == "stopped"
+                    && !old_services.contains_key(n.as_str())
+            })
+            .map(|(n, _)| n.clone())
+            .collect();
+        for name in new_enabled {
+            eprintln!("vigil-scan: starting newly added service '{}'", name);
+            if let Err(e) = self.start_service(&name) {
+                eprintln!(
+                    "vigil-scan: failed to start '{}' on reload: {}",
+                    name, e
+                );
             }
         }
 
@@ -858,19 +991,39 @@ fn default_supervise_paths() -> Vec<String> {
 }
 
 fn read_log_lines(path: &Path, max_lines: usize) -> Result<Vec<String>> {
+    use std::io::{Read, Seek, SeekFrom};
+
     let file = fs::File::open(path)
         .with_context(|| format!("log file not found: {}", path.display()))?;
+    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
 
-    let reader = std::io::BufReader::new(file);
-    let lines: Vec<String> = reader
-        .lines()
-        .collect::<Result<Vec<_>, _>>()?;
+    if size == 0 {
+        return Ok(Vec::new());
+    }
 
-    let start = if lines.len() > max_lines {
-        lines.len() - max_lines
-    } else {
-        0
-    };
+    let mut window: u64 = 0;
+    loop {
+        window = window.saturating_mul(4).max(16 * 1024).min(size);
+        let from = size - window;
 
-    Ok(lines[start..].to_vec())
+        let mut f = file.try_clone()?;
+        f.seek(SeekFrom::Start(from))?;
+        let mut buf = vec![0u8; window as usize];
+        f.read_exact(&mut buf)?;
+
+        let raw = String::from_utf8_lossy(&buf);
+        let mut parts: Vec<&str> = raw.split('\n').collect();
+        if raw.ends_with('\n') {
+            parts.pop();
+        }
+        if from > 0 {
+            parts.remove(0);
+        }
+
+        if parts.len() >= max_lines || from == 0 {
+            let take = max_lines.min(parts.len());
+            let start = parts.len() - take;
+            return Ok(parts[start..].iter().map(|s| s.to_string()).collect());
+        }
+    }
 }

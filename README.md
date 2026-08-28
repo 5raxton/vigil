@@ -50,7 +50,7 @@ Vigil is built around four guiding principles:
 ```
 
 - **`vigil`** — PID 1. Survives supervisor failures by design; respawns failed supervisors.
-- **`vigil-scan`** — the service manager / supervisor tree root. Event-driven, never polls.
+- **`vigil-scan`** — the service manager / supervisor tree root. Event-driven.
 - **`vigil-supervise`** — one per running service. Restarts with exponential backoff, enforces resource limits, and reaps its own children.
 - **`vigil-ctl`** — the control plane CLI (`start`, `stop`, `restart`, `status`, `list`, `log`, ...).
 - **`vigillog`** — per-service log rotator fed by a live pipe, so logs are never lost and rotation never requires stopping a service.
@@ -60,7 +60,8 @@ Vigil is built around four guiding principles:
 - **Dependency-aware startup** — requirement vs. ordering separated (`after` / `before` / `wants`), topological sort with cycle detection, run in dependency order for teardown.
 - **Boot targets** — `default_target` + per-target service enablement under `/etc/vigil/targets/`.
 - **Smart restart policy** — `always` / `on-failure` / `on-abnormal` / `never`, with exponential backoff and a restart ceiling to stop crash loops.
-- **Exponential backoff** — initial delay grows geometrically up to a cap.
+- **Exponential backoff** — initial delay grows geometrically up to a cap; both the delay and the restart tally reset after a stable run.
+- **Supervisor resilience** — a crashed supervisor is detected and respawned (a "second chance"), so one bad supervisor can never take down unrelated services; PID 1 likewise restarts the scanner if it ever dies.
 - **Resource limits** — max open files, processes, and address space per service.
 - **Per-service logging** — size- and count-based rotation via a live pipe; never lossy; never stops the service.
 - **Unix-socket control plane** — a simple, documented JSON-over-socket protocol (no D-Bus).
@@ -81,11 +82,13 @@ The following subsystems are **fully implemented** and exercised by the control-
 - Unix-socket JSON control plane (`vigil-ctl`), config reload (`SIGHUP`)
 - Resource limits (open files, processes, address space)
 
-The following fields are **reserved but not yet implemented**: `service.readiness` (pid/socket/signal/exec readiness checks), `service.resource_limits.cpu_shares` (cgroup), and socket activation (`[socket]`). They are accepted by the parser for forward-compatibility but currently have no effect; dependents in these configurations start once the supervisor has spawned the service rather than after a custom readiness check.
+The following fields are **reserved but not yet implemented**: `service.readiness` (pid/socket/signal/exec readiness checks), `service.resource_limits.cpu_shares` (cgroup), socket activation (`[socket]`), and the `[target] requires` / per-service `optional` flags. They are accepted by the parser for forward-compatibility but currently have no effect.
+
+`logging.kind = "file"` and `"syslog"` are currently routed through the same per-service, size/count-rotated pipe log as `"pipe"` (written under `logging.path`, defaulting to `<log_dir>/<name>/`); native syslog forwarding is not yet implemented. `logging.timestamp` and `service.shutdown.kill_signal` are honored.
 
 ## Requirements
 
-- Rust **1.70+** (edition 2021)
+- Rust **1.87+** (edition 2021)
 - Linux (tested on the process supervisor, process-group, and reaper APIs)
 - For use as the system init, install as `/sbin/init` and run as PID 1
 

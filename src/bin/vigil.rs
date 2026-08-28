@@ -143,9 +143,9 @@ fn set_hostname() {
 
 fn setup_runtime() {
     for dir in &[
-        "/run/vigil",
-        "/run/vigil/supervise",
-        "/var/log/vigil",
+        vigil::VIGIL_RUNTIME_DIR,
+        vigil::VIGIL_SUPERVISE_DIR,
+        vigil::VIGIL_LOG_DIR,
     ] {
         let _ = fs::create_dir_all(dir);
     }

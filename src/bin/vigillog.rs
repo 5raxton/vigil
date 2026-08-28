@@ -6,7 +6,7 @@ use std::process::exit;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: vigillog <service_name> [log_dir] [max_size_mb] [max_files]");
+        eprintln!("usage: vigillog <service_name> [log_dir] [max_size_mb] [max_files] [timestamp]");
         exit(1);
     }
 
@@ -20,6 +20,7 @@ fn main() {
         .get(4)
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
+    let timestamp: bool = args.get(5).map(|s| s == "1").unwrap_or(true);
 
     let service_log_dir = PathBuf::from(&log_dir).join(service_name);
     if let Err(e) = fs::create_dir_all(&service_log_dir) {
@@ -43,7 +44,7 @@ fn main() {
             Ok(line) => {
                 line_count += 1;
 
-                if line_count % 1000 == 0 {
+                if line_count.is_multiple_of(1000) {
                     if let Ok(meta) = fs::metadata(&current_path) {
                         if meta.len() >= max_bytes {
                             rotate_logs(&service_log_dir, max_files);
@@ -51,7 +52,7 @@ fn main() {
                     }
                 }
 
-                if let Err(e) = write_log_line(&current_path, &line) {
+                if let Err(e) = write_log_line(&current_path, &line, timestamp) {
                     eprintln!(
                         "vigillog [{}]: write error: {}",
                         service_name, e
@@ -69,21 +70,23 @@ fn main() {
     }
 }
 
-fn write_log_line(path: &Path, line: &str) -> io::Result<()> {
+fn write_log_line(path: &Path, line: &str, timestamp: bool) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
 
-    let now = chrono_timestamp();
-    writeln!(file, "{} {}", now, line)?;
+    if timestamp {
+        let now = chrono_timestamp();
+        writeln!(file, "{} {}", now, line)?;
+    } else {
+        writeln!(file, "{}", line)?;
+    }
     file.flush()?;
     Ok(())
 }
 
 fn rotate_logs(dir: &Path, max_files: u32) {
-    let _ = fs::remove_file(dir.join(format!(".{}.tmp", max_files)));
-
     for i in (1..max_files).rev() {
         let from = dir.join(i.to_string());
         let to = dir.join((i + 1).to_string());

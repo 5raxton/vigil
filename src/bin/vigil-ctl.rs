@@ -47,7 +47,7 @@ enum Command {
     Log {
         #[arg()]
         service: String,
-        #[arg(short, long, default_value = "50")]
+        #[arg(short = 'n', long, default_value = "50")]
         lines: usize,
     },
     Reload,
@@ -120,8 +120,8 @@ fn main() -> Result<()> {
                 println!("No services loaded.");
             } else {
                 println!(
-                    "{:<20} {:<12} {:<8} {}",
-                    "NAME", "STATE", "PID", "DESCRIPTION"
+                    "{:<20} {:<12} {:<8} DESCRIPTION",
+                    "NAME", "STATE", "PID"
                 );
                 println!("{}", "-".repeat(60));
                 for svc in &services {

@@ -22,7 +22,7 @@ impl Default for GlobalConfig {
             control_socket: PathBuf::from("/run/vigil/control.sock"),
             log_dir: PathBuf::from("/var/log/vigil"),
             runtime_dir: PathBuf::from("/run/vigil"),
-            default_target: String::from("default"),
+            default_target: String::from(crate::DEFAULT_TARGET),
             hostname: None,
         }
     }
@@ -308,4 +308,55 @@ pub struct TargetServiceEntry {
 
 fn default_true() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn examples_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples")
+    }
+
+    fn toml_paths(dir: &PathBuf) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+                    out.push(path);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn example_configs_parse() {
+        let base = examples_dir();
+        assert!(base.exists(), "examples dir not found: {}", base.display());
+
+        let global_path = base.join("vigil.toml");
+        if global_path.exists() {
+            let content = std::fs::read_to_string(&global_path).unwrap();
+            toml::from_str::<GlobalConfig>(&content)
+                .unwrap_or_else(|e| panic!("vigil.toml must parse as GlobalConfig: {}", e));
+        }
+
+        for path in toml_paths(&base.join("services")) {
+            let content = std::fs::read_to_string(&path).unwrap();
+            toml::from_str::<ServiceConfig>(&content).unwrap_or_else(|e| {
+                panic!("{} must parse as ServiceConfig: {}", path.display(), e)
+            });
+        }
+
+        for path in toml_paths(&base.join("targets")) {
+            let content = std::fs::read_to_string(&path).unwrap();
+            toml::from_str::<TargetConfig>(&content).unwrap_or_else(|e| {
+                panic!("{} must parse as TargetConfig: {}", path.display(), e)
+            });
+        }
+    }
 }
