@@ -2,27 +2,14 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
-    Status {
-        service: Option<String>,
-    },
-    Start {
-        service: String,
-    },
-    Stop {
-        service: String,
-    },
-    Restart {
-        service: String,
-    },
+    Status { service: Option<String> },
+    Start { service: String },
+    Stop { service: String },
+    Restart { service: String },
     List,
-    Log {
-        service: String,
-        lines: usize,
-    },
+    Log { service: String, lines: usize },
     Reload,
-    Shutdown {
-        action: ShutdownAction,
-    },
+    Shutdown { action: ShutdownAction },
     Ping,
 }
 
@@ -35,12 +22,8 @@ pub enum ShutdownAction {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
-    Ok {
-        message: String,
-    },
-    Error {
-        message: String,
-    },
+    Ok { message: String },
+    Error { message: String },
     Status(ServiceStatus),
     List(Vec<ServiceInfo>),
     LogLines(Vec<String>),

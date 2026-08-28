@@ -6,11 +6,7 @@ use std::path::PathBuf;
 use vigil::protocol::{self, Request, Response, ShutdownAction};
 
 #[derive(Parser)]
-#[command(
-    name = "vigil-ctl",
-    about = "Vigil init system control tool",
-    version
-)]
+#[command(name = "vigil-ctl", about = "Vigil init system control tool", version)]
 struct Cli {
     #[arg(
         short,
@@ -119,10 +115,7 @@ fn main() -> Result<()> {
             if services.is_empty() {
                 println!("No services loaded.");
             } else {
-                println!(
-                    "{:<20} {:<12} {:<8} DESCRIPTION",
-                    "NAME", "STATE", "PID"
-                );
+                println!("{:<20} {:<12} {:<8} DESCRIPTION", "NAME", "STATE", "PID");
                 println!("{}", "-".repeat(60));
                 for svc in &services {
                     println!(
@@ -146,13 +139,12 @@ fn main() -> Result<()> {
 }
 
 fn send_request(socket_path: &PathBuf, request: &Request) -> Result<Response> {
-    let mut stream = UnixStream::connect(socket_path)
-        .with_context(|| {
-            format!(
-                "failed to connect to vigil at {}\nIs vigil-scan running?",
-                socket_path.display()
-            )
-        })?;
+    let mut stream = UnixStream::connect(socket_path).with_context(|| {
+        format!(
+            "failed to connect to vigil at {}\nIs vigil-scan running?",
+            socket_path.display()
+        )
+    })?;
 
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(30)))
@@ -161,8 +153,7 @@ fn send_request(socket_path: &PathBuf, request: &Request) -> Result<Response> {
         .set_write_timeout(Some(std::time::Duration::from_secs(10)))
         .ok();
 
-    protocol::write_message(&mut stream, request)
-        .context("failed to send request")?;
+    protocol::write_message(&mut stream, request).context("failed to send request")?;
 
     let response: Response =
         protocol::read_message(&mut stream).context("failed to read response")?;

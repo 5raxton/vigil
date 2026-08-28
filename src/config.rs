@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -17,11 +18,11 @@ pub struct GlobalConfig {
 impl Default for GlobalConfig {
     fn default() -> Self {
         Self {
-            service_dir: PathBuf::from("/etc/vigil/services"),
-            target_dir: PathBuf::from("/etc/vigil/targets"),
-            control_socket: PathBuf::from("/run/vigil/control.sock"),
-            log_dir: PathBuf::from("/var/log/vigil"),
-            runtime_dir: PathBuf::from("/run/vigil"),
+            service_dir: PathBuf::from(crate::VIGIL_SERVICE_DIR),
+            target_dir: PathBuf::from(crate::VIGIL_TARGET_DIR),
+            control_socket: PathBuf::from(crate::VIGIL_CONTROL_SOCKET),
+            log_dir: PathBuf::from(crate::VIGIL_LOG_DIR),
+            runtime_dir: PathBuf::from(crate::VIGIL_RUNTIME_DIR),
             default_target: String::from(crate::DEFAULT_TARGET),
             hostname: None,
         }
@@ -145,6 +146,20 @@ pub struct ReadinessConfig {
 
 fn default_readiness_type() -> ReadinessType {
     ReadinessType::None
+}
+
+impl ReadinessConfig {
+    /// How long the supervisor will wait for the service to become ready
+    /// before the start is treated as failed.
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.unwrap_or(30_000))
+    }
+
+    /// The signal name a `signal`-type service must raise to report
+    /// readiness (defaults to `USR1`).
+    pub fn ready_signal(&self) -> &str {
+        self.signal.as_deref().unwrap_or("USR1")
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
@@ -284,6 +299,18 @@ fn default_socket_type() -> String {
     String::from("tcp")
 }
 
+impl SocketConfig {
+    /// Effective protocol for listen specs that carry no `tcp:`/`udp:`/
+    /// `unix:` prefix.
+    pub fn proto(&self) -> &str {
+        if self.socket_type.is_empty() {
+            crate::sockspec::default_type()
+        } else {
+            self.socket_type.as_str()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct TargetConfig {
     pub target: TargetSpec,
@@ -354,9 +381,42 @@ mod tests {
 
         for path in toml_paths(&base.join("targets")) {
             let content = std::fs::read_to_string(&path).unwrap();
-            toml::from_str::<TargetConfig>(&content).unwrap_or_else(|e| {
-                panic!("{} must parse as TargetConfig: {}", path.display(), e)
-            });
+            toml::from_str::<TargetConfig>(&content)
+                .unwrap_or_else(|e| panic!("{} must parse as TargetConfig: {}", path.display(), e));
         }
+    }
+
+    #[test]
+    fn readiness_defaults() {
+        let rc = ReadinessConfig::default();
+        assert_eq!(rc.kind, ReadinessType::None);
+        assert_eq!(rc.timeout(), Duration::from_secs(30));
+        assert_eq!(rc.ready_signal(), "USR1");
+    }
+
+    #[test]
+    fn readiness_explicit_timeout_and_signal() {
+        let rc = ReadinessConfig {
+            kind: ReadinessType::Signal,
+            timeout_ms: Some(2000),
+            signal: Some("HUP".into()),
+            check: None,
+        };
+        assert_eq!(rc.timeout(), Duration::from_millis(2000));
+        assert_eq!(rc.ready_signal(), "HUP");
+    }
+
+    #[test]
+    fn socket_proto_defaults() {
+        let sc = SocketConfig {
+            listen: vec!["22".into()],
+            socket_type: "udp".into(),
+        };
+        assert_eq!(sc.proto(), "udp");
+        let sc2 = SocketConfig {
+            listen: vec!["22".into()],
+            socket_type: String::new(),
+        };
+        assert_eq!(sc2.proto(), "tcp");
     }
 }

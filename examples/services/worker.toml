@@ -1,0 +1,38 @@
+[service]
+description = "Background queue worker"
+command = "/usr/bin/worker"
+args = ["--queue", "high"]
+user = "vigil-worker"
+group = "vigil-workers"
+working_dir = "/srv/app"
+
+[service.readiness]
+type = "exec"
+check = "[ -f /run/vigil/worker.ready ]"
+
+[service.restart]
+policy = "on-abnormal"
+max_restarts = 3
+
+[service.shutdown]
+signal = "INT"
+timeout_ms = 10000
+kill_signal = "KILL"
+
+[service.resource_limits]
+max_files = 1024
+max_procs = 64
+max_memory_mb = 512
+cpu_shares = 512
+
+[logging]
+type = "file"
+path = "/var/log/vigil/worker/current.log"
+max_size_mb = 20
+max_files = 3
+timestamp = true
+
+[[dependencies]]
+service = "dbus"
+type = "after"
+required = true

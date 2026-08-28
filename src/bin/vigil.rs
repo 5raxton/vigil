@@ -26,12 +26,7 @@ fn main() {
 
 fn setup_console() {
     let dev_console = CString::new("/dev/console").unwrap();
-    let fd = unsafe {
-        libc::open(
-            dev_console.as_ptr(),
-            libc::O_RDWR | libc::O_NOCTTY,
-        )
-    };
+    let fd = unsafe { libc::open(dev_console.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
     if fd >= 0 {
         unsafe {
             libc::dup2(fd, 0);
@@ -41,12 +36,7 @@ fn setup_console() {
         }
     } else {
         let dev_null = CString::new("/dev/null").unwrap();
-        let fd = unsafe {
-            libc::open(
-                dev_null.as_ptr(),
-                libc::O_RDWR | libc::O_NOCTTY,
-            )
-        };
+        let fd = unsafe { libc::open(dev_null.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
         if fd >= 0 {
             unsafe {
                 libc::dup2(fd, 0);
@@ -120,7 +110,10 @@ fn mount_filesystems() {
         };
         match result {
             Ok(()) => eprintln!("vigil: mounted {}", target),
-            Err(e) => eprintln!("vigil: mount {} failed (may already be mounted): {}", target, e),
+            Err(e) => eprintln!(
+                "vigil: mount {} failed (may already be mounted): {}",
+                target, e
+            ),
         }
     }
 }
@@ -163,11 +156,7 @@ fn run_init_loop() {
         libc::sigaddset(&mut sigset, libc::SIGUSR1);
         libc::sigaddset(&mut sigset, libc::SIGUSR2);
         libc::sigaddset(&mut sigset, libc::SIGPWR);
-        libc::sigprocmask(
-            libc::SIG_BLOCK,
-            &sigset,
-            std::ptr::null_mut(),
-        );
+        libc::sigprocmask(libc::SIG_BLOCK, &sigset, std::ptr::null_mut());
     }
 
     let mut scanner_pid: Option<nix::unistd::Pid>;
@@ -235,38 +224,12 @@ fn spawn_scanner() -> nix::unistd::Pid {
             child
         }
         Ok(ForkResult::Child) => {
-            let exe_path = std::env::current_exe().ok();
             let scan_name = CString::new("vigil-scan").unwrap();
+            let args = std::slice::from_ref(&scan_name);
 
-            let search_paths = if let Some(ref exe) = exe_path {
-                if let Some(dir) = exe.parent() {
-                    let mut paths: Vec<String> = vec![dir.join("vigil-scan").to_string_lossy().to_string()];
-                    paths.extend(
-                        ["/usr/local/bin", "/usr/bin", "/bin"]
-                            .iter()
-                            .map(|p| format!("{}/vigil-scan", p)),
-                    );
-                    paths
-                } else {
-                    vec![
-                        "/usr/local/bin/vigil-scan".into(),
-                        "/usr/bin/vigil-scan".into(),
-                        "/bin/vigil-scan".into(),
-                    ]
-                }
-            } else {
-                vec![
-                    "/usr/local/bin/vigil-scan".into(),
-                    "/usr/bin/vigil-scan".into(),
-                    "/bin/vigil-scan".into(),
-                ]
-            };
-
-            for path in &search_paths {
-                if let Ok(c_path) = CString::new(path.as_str()) {
-                    if execvp(&c_path, std::slice::from_ref(&scan_name)).is_ok() {
-                        unreachable!();
-                    }
+            for path in vigil::util::exec_search_paths("vigil-scan") {
+                if let Ok(c_path) = CString::new(path.to_string_lossy().as_bytes()) {
+                    let _ = execvp(&c_path, args);
                 }
             }
 

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::time::{Duration, Instant};
 
-use vigil::config::{GlobalConfig, ServiceConfig, TargetConfig};
+use vigil::config::{GlobalConfig, LogType, ServiceConfig, TargetConfig};
 use vigil::dep::DepGraph;
 use vigil::protocol::{self, Request, Response, ServiceInfo, ServiceStatus};
 
@@ -30,6 +30,13 @@ struct Scanner {
     services: HashMap<String, ServiceState>,
     dep_graph: DepGraph,
     control_listener: Option<UnixListener>,
+    /// Services that must come up with the boot target: those named in
+    /// `[target] requires` plus enabled, non-optional target entries and
+    /// everything pulled in by their required dependencies.
+    required_services: HashSet<String>,
+    /// Set when a required service gives up, so operators can see the boot
+    /// did not complete cleanly (persisted to `<runtime>/degraded`).
+    degraded: bool,
     running: bool,
 }
 
@@ -43,6 +50,8 @@ fn main() -> Result<()> {
         services: HashMap::new(),
         dep_graph: DepGraph::new(),
         control_listener: None,
+        required_services: HashSet::new(),
+        degraded: false,
         running: true,
     };
 
@@ -73,8 +82,7 @@ fn main() -> Result<()> {
 fn load_global_config() -> Result<GlobalConfig> {
     let config_path = "/etc/vigil/vigil.toml";
     if Path::new(config_path).exists() {
-        let content = fs::read_to_string(config_path)
-            .context("failed to read vigil.toml")?;
+        let content = fs::read_to_string(config_path).context("failed to read vigil.toml")?;
         let config: GlobalConfig =
             toml::from_str(&content).context("failed to parse vigil.toml")?;
         Ok(config)
@@ -91,8 +99,7 @@ fn ensure_directories(config: &GlobalConfig) -> Result<()> {
         &config.runtime_dir,
     ];
     for dir in &dirs {
-        fs::create_dir_all(dir)
-            .with_context(|| format!("failed to create {}", dir.display()))?;
+        fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
     }
 
     let supervise_dir = config.runtime_dir.join("supervise");
@@ -115,8 +122,8 @@ impl Scanner {
             return Ok(());
         }
 
-        for entry in fs::read_dir(&self.config.service_dir)
-            .context("failed to read service directory")?
+        for entry in
+            fs::read_dir(&self.config.service_dir).context("failed to read service directory")?
         {
             let entry = entry?;
             let path = entry.path();
@@ -146,19 +153,11 @@ impl Scanner {
                             );
                         }
                         Err(e) => {
-                            eprintln!(
-                                "vigil-scan: failed to parse {}: {}",
-                                path.display(),
-                                e
-                            );
+                            eprintln!("vigil-scan: failed to parse {}: {}", path.display(), e);
                         }
                     },
                     Err(e) => {
-                        eprintln!(
-                            "vigil-scan: failed to read {}: {}",
-                            path.display(),
-                            e
-                        );
+                        eprintln!("vigil-scan: failed to read {}: {}", path.display(), e);
                     }
                 }
             }
@@ -197,15 +196,24 @@ impl Scanner {
     fn apply_target(&mut self, target_name: &str) -> Result<()> {
         let target_path = self.config.target_dir.join(format!("{}.toml", target_name));
 
+        // A missing or empty target means "bring up everything"; every
+        // configured service is considered required.
+        let mut enable_all = || {
+            for state in self.services.values_mut() {
+                state.enabled = true;
+            }
+            self.required_services = self.services.keys().cloned().collect();
+        };
+
         if !target_path.exists() {
             eprintln!(
                 "vigil-scan: boot target '{}' not found at {}; enabling all services",
                 target_name,
                 target_path.display()
             );
-            for state in self.services.values_mut() {
-                state.enabled = true;
-            }
+            enable_all();
+            self.degraded = false;
+            let _ = fs::remove_file(self.config.runtime_dir.join("degraded"));
             return Ok(());
         }
 
@@ -215,22 +223,107 @@ impl Scanner {
             toml::from_str(&content).with_context(|| "failed to parse target")?;
 
         let target_services = target.services;
+        let mut explicitly_disabled: HashSet<String> = HashSet::new();
+
         if target_services.is_empty() {
             eprintln!(
                 "vigil-scan: target '{}' defines no services; enabling all",
                 target_name
             );
-            for state in self.services.values_mut() {
-                state.enabled = true;
+            enable_all();
+        } else {
+            let mut required: HashSet<String> = target.target.requires.iter().cloned().collect();
+            for (name, state) in self.services.iter_mut() {
+                match target_services.get(name) {
+                    Some(entry) => {
+                        state.enabled = entry.enabled;
+                        if !entry.enabled {
+                            explicitly_disabled.insert(name.clone());
+                        }
+                        if entry.enabled && !entry.optional {
+                            required.insert(name.clone());
+                        }
+                    }
+                    None => state.enabled = false,
+                }
             }
-            return Ok(());
-        }
 
-        for (name, state) in self.services.iter_mut() {
-            state.enabled = target_services
-                .get(name)
-                .map(|e| e.enabled)
-                .unwrap_or(false);
+            // `[target] requires` always pulls services in, even if they are
+            // absent from (or disabled in) the services map.
+            for req in &target.target.requires {
+                if let Some(state) = self.services.get_mut(req) {
+                    if !state.enabled {
+                        state.enabled = true;
+                        eprintln!("vigil-scan: enabling required service '{}'", req);
+                    }
+                } else {
+                    eprintln!(
+                        "vigil-scan: WARNING: target requires '{}' which is not available",
+                        req
+                    );
+                    self.degraded = true;
+                }
+            }
+
+            // Close the "required" relation under required dependencies: if a
+            // required service needs another service to come up first, that
+            // dependency must come up too (and its failure degrades the target).
+            let available: HashSet<String> = self.services.keys().cloned().collect();
+            let mut queue: VecDeque<String> = required.iter().cloned().collect();
+            while let Some(name) = queue.pop_front() {
+                let deps: Vec<(String, bool)> = self
+                    .services
+                    .get(&name)
+                    .map(|s| {
+                        s.config
+                            .dependencies
+                            .iter()
+                            .map(|d| (d.service.clone(), d.required))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for (dep, dep_required) in deps {
+                    if !available.contains(&dep) {
+                        continue;
+                    }
+                    if !self.services[&dep].enabled {
+                        self.services.get_mut(&dep).unwrap().enabled = true;
+                        eprintln!(
+                            "vigil-scan: enabling dependency '{}' of required service '{}'",
+                            dep, name
+                        );
+                    }
+                    if dep_required && !required.contains(&dep) {
+                        required.insert(dep.clone());
+                        queue.push_back(dep);
+                    }
+                }
+            }
+
+            // `wants` services come up unless explicitly disabled in the target.
+            let enabled_services: Vec<String> = self
+                .services
+                .iter()
+                .filter(|(_, s)| s.enabled)
+                .map(|(n, _)| n.clone())
+                .collect();
+            for name in enabled_services {
+                for wanted in self.dep_graph.get_wanted_services(&name) {
+                    if !explicitly_disabled.contains(&wanted)
+                        && available.contains(&wanted)
+                        && !self.services[&wanted].enabled
+                    {
+                        self.services.get_mut(&wanted).unwrap().enabled = true;
+                        eprintln!("vigil-scan: enabling wanted service '{}'", wanted);
+                    }
+                }
+            }
+
+            // Only services we actually know about can be required.
+            self.required_services = required
+                .into_iter()
+                .filter(|n| self.services.contains_key(n))
+                .collect();
         }
 
         let enabled: Vec<String> = self
@@ -245,60 +338,15 @@ impl Scanner {
             enabled.len()
         );
 
-        let available: HashSet<String> = self.services.keys().cloned().collect();
-        let mut candidates: VecDeque<String> = self
-            .services
-            .iter()
-            .filter(|(_, s)| s.enabled)
-            .map(|(n, _)| n.clone())
-            .collect();
-
-        while let Some(name) = candidates.pop_front() {
-            let deps: Vec<(String, bool)> = self
-                .services
-                .get(&name)
-                .map(|s| {
-                    s.config
-                        .dependencies
-                        .iter()
-                        .map(|d| (d.service.clone(), d.required))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            for (dep, required) in deps {
-                if required && available.contains(&dep) {
-                    if let Some(state) = self.services.get_mut(&dep) {
-                        if !state.enabled {
-                            state.enabled = true;
-                            candidates.push_back(dep);
-                        }
-                    }
-                }
-            }
+        if !self.required_services.is_empty() {
+            eprintln!(
+                "vigil-scan: {} service(s) are required by this target",
+                self.required_services.len()
+            );
         }
 
-        let enabled_services: Vec<String> = self
-            .services
-            .iter()
-            .filter(|(_, s)| s.enabled)
-            .map(|(n, _)| n.clone())
-            .collect();
-        for name in enabled_services {
-            for wanted in self.dep_graph.get_wanted_services(&name) {
-                let explicitly_disabled = target_services
-                    .get(&wanted)
-                    .map(|e| !e.enabled)
-                    .unwrap_or(false);
-                if !explicitly_disabled
-                    && available.contains(&wanted)
-                    && !self.services[&wanted].enabled
-                {
-                    self.services.get_mut(&wanted).unwrap().enabled = true;
-                    eprintln!("vigil-scan: enabling wanted service '{}'", wanted);
-                }
-            }
-        }
+        self.degraded = false;
+        let _ = fs::remove_file(self.config.runtime_dir.join("degraded"));
 
         Ok(())
     }
@@ -359,71 +407,29 @@ impl Scanner {
                 Ok(())
             }
             Ok(ForkResult::Child) => {
-                let exe_path = std::env::current_exe().ok();
-                let supervise_name = CString::new("vigil-supervise").unwrap();
-
                 let service_name_c = CString::new(name.to_string()).unwrap();
-                let config_path_c = CString::new(
-                    state.config_path.to_string_lossy().to_string(),
-                )
-                .unwrap();
-                let log_dir_c = CString::new(
-                    self.config.log_dir.to_string_lossy().to_string(),
-                )
-                .unwrap();
+                let config_path_c =
+                    CString::new(state.config_path.to_string_lossy().to_string()).unwrap();
+                let log_dir_c =
+                    CString::new(self.config.log_dir.to_string_lossy().to_string()).unwrap();
 
-                let search_paths = if let Some(ref exe) = exe_path {
-                    if let Some(dir) = exe.parent() {
-                        let mut paths: Vec<String> = vec![dir
-                            .join("vigil-supervise")
-                            .to_string_lossy()
-                            .to_string()];
-                        paths.extend(
-                            ["/usr/local/bin", "/usr/bin", "/bin"]
-                                .iter()
-                                .map(|p| {
-                                    format!("{}/vigil-supervise", p)
-                                }),
-                        );
-                        paths
-                    } else {
-                        default_supervise_paths()
-                    }
-                } else {
-                    default_supervise_paths()
-                };
+                let argv: Vec<CString> = vec![
+                    CString::new("vigil-supervise").unwrap(),
+                    service_name_c,
+                    config_path_c,
+                    log_dir_c,
+                ];
 
-                for path in &search_paths {
-                    if let Ok(c_path) = CString::new(path.as_str()) {
-                        if execvp(
-                            &c_path,
-                            &[
-                                supervise_name.clone(),
-                                service_name_c.clone(),
-                                config_path_c.clone(),
-                                log_dir_c.clone(),
-                            ],
-                        )
-                        .is_ok()
-                        {
-                            unreachable!();
-                        }
+                for path in vigil::util::exec_search_paths("vigil-supervise") {
+                    if let Ok(path_c) = CString::new(path.to_string_lossy().as_bytes()) {
+                        let _ = execvp(&path_c, &argv);
                     }
                 }
 
-                eprintln!(
-                    "vigil-scan: failed to exec vigil-supervise for {}",
-                    name
-                );
+                eprintln!("vigil-scan: failed to exec vigil-supervise for {}", name);
                 exit(1);
             }
-            Err(e) => {
-                Err(anyhow::anyhow!(
-                    "fork failed for service '{}': {}",
-                    name,
-                    e
-                ))
-            }
+            Err(e) => Err(anyhow::anyhow!("fork failed for service '{}': {}", name, e)),
         }
     }
 
@@ -440,14 +446,13 @@ impl Scanner {
         if let Some(pid) = state.supervisor_pid {
             let nix_pid = Pid::from_raw(pid as i32);
 
-            let grace = Duration::from_millis(state.config.service.shutdown.timeout_ms) + Duration::from_secs(2);
+            let grace = Duration::from_millis(state.config.service.shutdown.timeout_ms)
+                + Duration::from_secs(2);
             let start = Instant::now();
 
             let _ = nix::sys::signal::kill(nix_pid, Signal::SIGTERM);
 
-            while let Ok(WaitStatus::StillAlive) =
-                waitpid(nix_pid, Some(WaitPidFlag::WNOHANG))
-            {
+            while let Ok(WaitStatus::StillAlive) = waitpid(nix_pid, Some(WaitPidFlag::WNOHANG)) {
                 if start.elapsed() >= grace {
                     eprintln!(
                         "vigil-scan: supervisor for '{}' (PID {}) did not exit; force killing",
@@ -481,13 +486,12 @@ impl Scanner {
     fn open_control_socket(&mut self) -> Result<()> {
         let _ = fs::remove_file(&self.config.control_socket);
 
-        let listener = UnixListener::bind(&self.config.control_socket)
-            .with_context(|| {
-                format!(
-                    "failed to bind control socket: {}",
-                    self.config.control_socket.display()
-                )
-            })?;
+        let listener = UnixListener::bind(&self.config.control_socket).with_context(|| {
+            format!(
+                "failed to bind control socket: {}",
+                self.config.control_socket.display()
+            )
+        })?;
 
         listener.set_nonblocking(true)?;
         self.control_listener = Some(listener);
@@ -507,11 +511,7 @@ impl Scanner {
             libc::sigaddset(&mut sigset, libc::SIGTERM);
             libc::sigaddset(&mut sigset, libc::SIGINT);
             libc::sigaddset(&mut sigset, libc::SIGHUP);
-            libc::sigprocmask(
-                libc::SIG_BLOCK,
-                &sigset,
-                std::ptr::null_mut(),
-            );
+            libc::sigprocmask(libc::SIG_BLOCK, &sigset, std::ptr::null_mut());
         }
 
         let mut last_reap = Instant::now();
@@ -542,8 +542,7 @@ impl Scanner {
                         Ok((stream, _)) => {
                             self.handle_control_connection(stream);
                         }
-                        Err(e)
-                            if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                         Err(e) => {
                             eprintln!("vigil-scan: accept error: {}", e);
                         }
@@ -560,13 +559,7 @@ impl Scanner {
                 tv_sec: 0,
                 tv_nsec: 0,
             };
-            let signo = unsafe {
-                libc::sigtimedwait(
-                    &sigset,
-                    std::ptr::null_mut(),
-                    &timeout,
-                )
-            };
+            let signo = unsafe { libc::sigtimedwait(&sigset, std::ptr::null_mut(), &timeout) };
 
             if signo > 0 {
                 match signo {
@@ -610,17 +603,24 @@ impl Scanner {
                         let was_supervising = self.supervisor_was_live(&name);
                         let mut respawn = false;
                         if let Some(state) = self.services.get_mut(&name) {
+                            let degraded = !(state.enabled
+                                && was_supervising
+                                && state.restart_count < state.config.service.restart.max_restarts)
+                                && state.enabled
+                                && self.required_services.contains(&name);
                             state.supervisor_pid = None;
                             state.state = "stopped".into();
                             if state.enabled
                                 && was_supervising
-                                && state.restart_count
-                                    < state.config.service.restart.max_restarts
+                                && state.restart_count < state.config.service.restart.max_restarts
                             {
                                 state.restart_count += 1;
                                 respawn = true;
                             } else {
                                 state.restart_count = 0;
+                            }
+                            if degraded {
+                                self.mark_degraded(&name);
                             }
                         }
                         if respawn {
@@ -688,6 +688,53 @@ impl Scanner {
         fs::read_to_string(&path)
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok())
+    }
+
+    /// Mark the boot as degraded: a service that is required by the active
+    /// target has given up. Persists `<runtime>/degraded` so operators can see
+    /// a boot did not complete cleanly.
+    fn mark_degraded(&mut self, name: &str) {
+        if self.degraded {
+            return;
+        }
+        self.degraded = true;
+        eprintln!(
+            "vigil-scan: DEGRADED: required service '{}' failed or gave up",
+            name
+        );
+        let _ = fs::write(
+            self.config.runtime_dir.join("degraded"),
+            format!("{}\n", name),
+        );
+    }
+
+    /// Resolve the on-disk log file for a service, taking its configured
+    /// logging kind into account. Services with `logging.kind = file` write
+    /// to `logging.path` directly (or `<log_dir>/<service>`, mirrored by the
+    /// vigillog file rotation inside it); `pipe` services write to
+    /// `<path>/current`. syslog/none services have no scannable log file.
+    fn log_file_for(&self, name: &str) -> Option<PathBuf> {
+        let state = self.services.get(name)?;
+        match state.config.logging.kind {
+            LogType::Pipe => Some(
+                state
+                    .config
+                    .logging
+                    .path
+                    .as_ref()
+                    .map(|p| p.join("current"))
+                    .unwrap_or_else(|| self.config.log_dir.join(name).join("current")),
+            ),
+            LogType::File => Some(
+                state
+                    .config
+                    .logging
+                    .path
+                    .clone()
+                    .unwrap_or_else(|| self.config.log_dir.join(name).join("current")),
+            ),
+            LogType::Syslog | LogType::None => None,
+        }
     }
 
     fn handle_control_connection(&mut self, mut stream: UnixStream) {
@@ -819,10 +866,7 @@ impl Scanner {
                             message: format!("service '{}' restarted", service),
                         },
                         Err(e) => Response::Error {
-                            message: format!(
-                                "stopped '{}' but failed to restart: {}",
-                                service, e
-                            ),
+                            message: format!("stopped '{}' but failed to restart: {}", service, e),
                         },
                     },
                     Err(e) => Response::Error {
@@ -831,24 +875,20 @@ impl Scanner {
                 }
             }
 
-            Request::Log { service, lines } => {
-                let log_path = match self.services.get(&service) {
-                    Some(state) => match state.config.logging.path.as_ref() {
-                        Some(p) => p.join("current"),
-                        None => self.config.log_dir.join(&service).join("current"),
-                    },
-                    None => self.config.log_dir.join(&service).join("current"),
-                };
-                match read_log_lines(&log_path, lines) {
+            Request::Log { service, lines } => match self.log_file_for(&service) {
+                Some(log_path) => match read_log_lines(&log_path, lines) {
                     Ok(log_lines) => Response::LogLines(log_lines),
                     Err(e) => Response::Error {
-                        message: format!(
-                            "failed to read logs for '{}': {}",
-                            service, e
-                        ),
+                        message: format!("failed to read logs for '{}': {}", service, e),
                     },
-                }
-            }
+                },
+                None => Response::Error {
+                    message: format!(
+                        "service '{}' has no log file (logging.kind is syslog/none)",
+                        service
+                    ),
+                },
+            },
 
             Request::Reload => match self.reload_services() {
                 Ok(()) => Response::Ok {
@@ -881,8 +921,7 @@ impl Scanner {
     }
 
     fn reload_services(&mut self) -> Result<()> {
-        let old_services: HashMap<String, ServiceState> =
-            std::mem::take(&mut self.services);
+        let old_services: HashMap<String, ServiceState> = std::mem::take(&mut self.services);
         self.dep_graph = DepGraph::new();
 
         self.load_services()?;
@@ -929,19 +968,14 @@ impl Scanner {
             .services
             .iter()
             .filter(|(n, s)| {
-                s.enabled
-                    && s.state == "stopped"
-                    && !old_services.contains_key(n.as_str())
+                s.enabled && s.state == "stopped" && !old_services.contains_key(n.as_str())
             })
             .map(|(n, _)| n.clone())
             .collect();
         for name in new_enabled {
             eprintln!("vigil-scan: starting newly added service '{}'", name);
             if let Err(e) = self.start_service(&name) {
-                eprintln!(
-                    "vigil-scan: failed to start '{}' on reload: {}",
-                    name, e
-                );
+                eprintln!("vigil-scan: failed to start '{}' on reload: {}", name, e);
             }
         }
 
@@ -966,10 +1000,7 @@ impl Scanner {
                 if state.state == "running" || state.state == "starting" {
                     eprintln!("vigil-scan: stopping '{}'", name);
                     if let Err(e) = self.stop_service(name) {
-                        eprintln!(
-                            "vigil-scan: failed to stop '{}': {}",
-                            name, e
-                        );
+                        eprintln!("vigil-scan: failed to stop '{}': {}", name, e);
                     }
                 }
             }
@@ -982,19 +1013,11 @@ impl Scanner {
     }
 }
 
-fn default_supervise_paths() -> Vec<String> {
-    vec![
-        "/usr/local/bin/vigil-supervise".into(),
-        "/usr/bin/vigil-supervise".into(),
-        "/bin/vigil-supervise".into(),
-    ]
-}
-
 fn read_log_lines(path: &Path, max_lines: usize) -> Result<Vec<String>> {
     use std::io::{Read, Seek, SeekFrom};
 
-    let file = fs::File::open(path)
-        .with_context(|| format!("log file not found: {}", path.display()))?;
+    let file =
+        fs::File::open(path).with_context(|| format!("log file not found: {}", path.display()))?;
     let size = file.metadata().map(|m| m.len()).unwrap_or(0);
 
     if size == 0 {

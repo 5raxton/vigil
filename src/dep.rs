@@ -54,10 +54,7 @@ impl DepGraph {
     }
 
     pub fn get_wanted_services(&self, service: &str) -> Vec<String> {
-        self.edges_wants
-            .get(service)
-            .cloned()
-            .unwrap_or_default()
+        self.edges_wants.get(service).cloned().unwrap_or_default()
     }
 
     pub fn get_missing_required(&self, available: &HashSet<String>) -> Vec<(String, String)> {
@@ -173,9 +170,7 @@ mod tests {
         graph.add_service("b".into());
         graph.add_dependency("b", &dep_after("a"));
 
-        let order = graph
-            .resolve_order(&["a".into(), "b".into()])
-            .unwrap();
+        let order = graph.resolve_order(&["a".into(), "b".into()]).unwrap();
         assert_eq!(order, vec!["a", "b"]);
     }
 
@@ -197,9 +192,7 @@ mod tests {
         graph.add_service("b".into());
         graph.add_dependency("a", &dep_before("b"));
 
-        let order = graph
-            .resolve_order(&["a".into(), "b".into()])
-            .unwrap();
+        let order = graph.resolve_order(&["a".into(), "b".into()]).unwrap();
         assert_eq!(order, vec!["a", "b"]);
     }
 
@@ -268,6 +261,9 @@ mod tests {
         let order = graph
             .resolve_order(&["a".into(), "b".into(), "c".into()])
             .unwrap();
-        assert!(order.iter().position(|s| s == "c").unwrap() < order.iter().position(|s| s == "b").unwrap());
+        assert!(
+            order.iter().position(|s| s == "c").unwrap()
+                < order.iter().position(|s| s == "b").unwrap()
+        );
     }
 }

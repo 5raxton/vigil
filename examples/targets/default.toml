@@ -1,10 +1,8 @@
 [target]
 description = "Default multi-user runlevel"
-requires = []
+requires = ["network", "dbus"]
 
 [services]
-"syslog" = { enabled = true }
+"syslog" = { enabled = true, optional = true }
 "ntpd" = { enabled = true }
 "sshd" = { enabled = true }
-"dbus" = { enabled = true, optional = true }
-"network" = { enabled = true }
