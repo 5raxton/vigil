@@ -106,24 +106,23 @@ fn chrono_timestamp() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
+        .as_secs() as libc::time_t;
 
-    let days = now / 86400;
-    let secs = now % 86400;
-    let hours = secs / 3600;
-    let mins = (secs % 3600) / 60;
-    let secs = secs % 60;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::gmtime_r(&now, &mut tm);
+    }
 
-    let year = 1970 + (days as f64 / 365.25) as u64;
-    let day_of_year = days % 365;
+    let mut buf = [0u8; 32];
+    let fmt = b"%Y-%m-%dT%H:%M:%S\0";
+    let n = unsafe {
+        libc::strftime(
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            fmt.as_ptr() as *const libc::c_char,
+            &tm,
+        )
+    };
 
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        year,
-        (day_of_year / 30 + 1).min(12),
-        (day_of_year % 30 + 1).min(31),
-        hours,
-        mins,
-        secs
-    )
+    String::from_utf8_lossy(&buf[..n.min(buf.len())]).into_owned()
 }

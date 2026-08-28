@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::time::{Duration, Instant};
 
-use vigil::config::{GlobalConfig, ServiceConfig};
+use vigil::config::{GlobalConfig, ServiceConfig, TargetConfig};
 use vigil::dep::DepGraph;
 use vigil::protocol::{self, Request, Response, ServiceInfo, ServiceStatus};
 
@@ -20,7 +20,7 @@ struct ServiceState {
     config: ServiceConfig,
     config_path: PathBuf,
     state: String,
-    pid: Option<u32>,
+    supervisor_pid: Option<u32>,
     restart_count: u32,
     start_time: Option<Instant>,
     enabled: bool,
@@ -53,9 +53,12 @@ fn main() -> Result<()> {
     eprintln!("vigil-scan: building dependency graph");
     scanner.build_dep_graph()?;
 
+    eprintln!("vigil-scan: resolving boot target");
+    scanner.apply_target(&config.default_target)?;
+
     eprintln!(
         "vigil-scan: starting {} services",
-        scanner.services.len()
+        scanner.services.values().filter(|s| s.enabled).count()
     );
     scanner.start_services()?;
 
@@ -136,7 +139,7 @@ impl Scanner {
                                     config,
                                     config_path: path,
                                     state: "stopped".into(),
-                                    pid: None,
+                                    supervisor_pid: None,
                                     restart_count: 0,
                                     start_time: None,
                                     enabled: true,
@@ -192,6 +195,75 @@ impl Scanner {
         Ok(())
     }
 
+    fn apply_target(&mut self, target_name: &str) -> Result<()> {
+        let target_path = self.config.target_dir.join(format!("{}.toml", target_name));
+
+        if !target_path.exists() {
+            eprintln!(
+                "vigil-scan: boot target '{}' not found at {}; enabling all services",
+                target_name,
+                target_path.display()
+            );
+            for state in self.services.values_mut() {
+                state.enabled = true;
+            }
+            return Ok(());
+        }
+
+        let content = fs::read_to_string(&target_path)
+            .with_context(|| format!("failed to read target: {}", target_path.display()))?;
+        let target: TargetConfig =
+            toml::from_str(&content).with_context(|| "failed to parse target")?;
+
+        let target_services = target.services;
+        if target_services.is_empty() {
+            eprintln!(
+                "vigil-scan: target '{}' defines no services; enabling all",
+                target_name
+            );
+            for state in self.services.values_mut() {
+                state.enabled = true;
+            }
+            return Ok(());
+        }
+
+        for (name, state) in self.services.iter_mut() {
+            state.enabled = target_services
+                .get(name)
+                .map(|e| e.enabled)
+                .unwrap_or(false);
+        }
+
+        let enabled: Vec<String> = self
+            .services
+            .iter()
+            .filter(|(_, s)| s.enabled)
+            .map(|(n, _)| n.clone())
+            .collect();
+        eprintln!(
+            "vigil-scan: target '{}' enables {} service(s)",
+            target_name,
+            enabled.len()
+        );
+
+        let available: HashSet<String> = self.services.keys().cloned().collect();
+        let mut to_enable: Vec<String> = Vec::new();
+        for name in &enabled {
+            for dep in &self.services[name].config.dependencies {
+                if dep.required && available.contains(&dep.service) && !self.services[&dep.service].enabled {
+                    to_enable.push(dep.service.clone());
+                }
+            }
+        }
+        for dep in to_enable {
+            if let Some(s) = self.services.get_mut(&dep) {
+                s.enabled = true;
+            }
+        }
+
+        Ok(())
+    }
+
     fn start_services(&mut self) -> Result<()> {
         let names: Vec<String> = self.services.keys().cloned().collect();
 
@@ -243,7 +315,7 @@ impl Scanner {
                     name, child
                 );
                 state.state = "running".into();
-                state.pid = Some(child.as_raw() as u32);
+                state.supervisor_pid = Some(child.as_raw() as u32);
                 state.start_time = Some(Instant::now());
                 Ok(())
             }
@@ -326,29 +398,20 @@ impl Scanner {
             return Ok(());
         }
 
-        if let Some(pid) = state.pid {
+        if let Some(pid) = state.supervisor_pid {
             let nix_pid = Pid::from_raw(pid as i32);
 
-            let shutdown_signal = match state.config.service.shutdown.signal.as_str() {
-                "HUP" => Signal::SIGHUP,
-                "INT" => Signal::SIGINT,
-                "QUIT" => Signal::SIGQUIT,
-                "USR1" => Signal::SIGUSR1,
-                "USR2" => Signal::SIGUSR2,
-                _ => Signal::SIGTERM,
-            };
-
-            let _ = nix::sys::signal::kill(nix_pid, shutdown_signal);
-
-            let timeout = Duration::from_millis(state.config.service.shutdown.timeout_ms);
+            let grace = Duration::from_millis(state.config.service.shutdown.timeout_ms) + Duration::from_secs(2);
             let start = Instant::now();
+
+            let _ = nix::sys::signal::kill(nix_pid, Signal::SIGTERM);
 
             loop {
                 match waitpid(nix_pid, Some(WaitPidFlag::WNOHANG)) {
                     Ok(WaitStatus::StillAlive) => {
-                        if start.elapsed() >= timeout {
+                        if start.elapsed() >= grace {
                             eprintln!(
-                                "vigil-scan: force killing '{}' (PID {})",
+                                "vigil-scan: supervisor for '{}' (PID {}) did not exit; force killing",
                                 name, pid
                             );
                             let _ = nix::sys::signal::kill(nix_pid, Signal::SIGKILL);
@@ -362,7 +425,7 @@ impl Scanner {
             }
 
             state.state = "stopped".into();
-            state.pid = None;
+            state.supervisor_pid = None;
             state.start_time = None;
 
             let status_dir = self
@@ -498,14 +561,14 @@ impl Scanner {
                 Ok(WaitStatus::Exited(pid, _)) | Ok(WaitStatus::Signaled(pid, _, _)) => {
                     let pid_val = pid.as_raw() as u32;
                     for (name, state) in self.services.iter_mut() {
-                        if state.pid == Some(pid_val) {
+                        if state.supervisor_pid == Some(pid_val) {
                             eprintln!(
                                 "vigil-scan: supervisor for '{}' (PID {}) terminated",
                                 name, pid_val
                             );
-                            state.pid = None;
+                            state.supervisor_pid = None;
                             state.state = "stopped".into();
-                            state.restart_count += 1;
+                            state.restart_count = 0;
                             break;
                         }
                     }
@@ -515,6 +578,19 @@ impl Scanner {
                 Err(_) => break,
             }
         }
+    }
+
+    fn read_service_pid(&self, name: &str) -> Option<u32> {
+        let pid_path = self
+            .config
+            .runtime_dir
+            .join("supervise")
+            .join(name)
+            .join("status")
+            .join("pid");
+        fs::read_to_string(&pid_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
     }
 
     fn handle_control_connection(&mut self, mut stream: UnixStream) {
@@ -549,7 +625,7 @@ impl Scanner {
                     .map(|(name, state)| ServiceInfo {
                         name: name.clone(),
                         state: state.state.clone(),
-                        pid: state.pid,
+                        pid: self.read_service_pid(name),
                         description: state.config.service.description.clone(),
                     })
                     .collect();
@@ -559,10 +635,11 @@ impl Scanner {
             Request::Status { service } => match service {
                 Some(name) => {
                     if let Some(state) = self.services.get(&name) {
+                        let service_pid = self.read_service_pid(&name);
                         Response::Status(ServiceStatus {
                             name: name.clone(),
                             state: state.state.clone(),
-                            pid: state.pid,
+                            pid: service_pid,
                             uptime_secs: state
                                 .start_time
                                 .map(|t| t.elapsed().as_secs())
@@ -584,7 +661,7 @@ impl Scanner {
                         .map(|(name, state)| ServiceInfo {
                             name: name.clone(),
                             state: state.state.clone(),
-                            pid: state.pid,
+                            pid: self.read_service_pid(name),
                             description: state.config.service.description.clone(),
                         })
                         .collect();
@@ -674,6 +751,18 @@ impl Scanner {
             },
 
             Request::Shutdown { action } => {
+                let sig = match action {
+                    vigil::protocol::ShutdownAction::Poweroff => libc::SIGUSR2,
+                    vigil::protocol::ShutdownAction::Reboot => libc::SIGTERM,
+                    vigil::protocol::ShutdownAction::Halt => libc::SIGUSR1,
+                };
+                eprintln!(
+                    "vigil-scan: shutdown requested ({:?}); notifying PID 1",
+                    action
+                );
+                unsafe {
+                    libc::kill(1, sig);
+                }
                 self.running = false;
                 Response::Ok {
                     message: format!("shutdown initiated: {:?}", action),
@@ -703,7 +792,7 @@ impl Scanner {
             if !new_names.contains(name) {
                 eprintln!("vigil-scan: service '{}' removed, stopping", name);
                 if let Some(old_state) = old_services.get(name) {
-                    if let Some(pid) = old_state.pid {
+                    if let Some(pid) = old_state.supervisor_pid {
                         unsafe {
                             libc::kill(pid as i32, libc::SIGTERM);
                         }
@@ -716,7 +805,7 @@ impl Scanner {
             if let Some(old_state) = old_services.get(name) {
                 if old_state.state == "running" {
                     state.state = "running".into();
-                    state.pid = old_state.pid;
+                    state.supervisor_pid = old_state.supervisor_pid;
                     state.restart_count = old_state.restart_count;
                     state.start_time = old_state.start_time;
                 }

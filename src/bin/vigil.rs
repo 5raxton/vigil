@@ -171,12 +171,11 @@ fn run_init_loop() {
     }
 
     let mut scanner_pid: Option<nix::unistd::Pid>;
-    let mut shutdown_requested = false;
 
     scanner_pid = Some(spawn_scanner());
     eprintln!("vigil: entering init loop");
 
-    while !shutdown_requested {
+    loop {
         let mut signo: libc::c_int = 0;
         unsafe {
             libc::sigwait(&sigset, &mut signo);
@@ -190,17 +189,13 @@ fn run_init_loop() {
                         Ok(WaitStatus::StillAlive) => {}
                         Ok(status) => {
                             eprintln!("vigil: scanner exited with {:?}", status);
-                            if !shutdown_requested {
-                                eprintln!("vigil: restarting scanner (second-chance)");
-                                kill_all_children();
-                                scanner_pid = Some(spawn_scanner());
-                            }
+                            eprintln!("vigil: restarting scanner (second-chance)");
+                            kill_all_children();
+                            scanner_pid = Some(spawn_scanner());
                         }
                         Err(nix::errno::Errno::ECHILD) => {
-                            if !shutdown_requested {
-                                eprintln!("vigil: scanner gone, restarting");
-                                scanner_pid = Some(spawn_scanner());
-                            }
+                            eprintln!("vigil: scanner gone, restarting");
+                            scanner_pid = Some(spawn_scanner());
                         }
                         Err(_) => {}
                     }
@@ -208,25 +203,21 @@ fn run_init_loop() {
             }
             libc::SIGTERM | libc::SIGINT => {
                 eprintln!("vigil: shutdown signal received");
-                shutdown_requested = true;
                 stop_scanner(scanner_pid);
                 exec_shutdown("reboot");
             }
             libc::SIGUSR1 => {
                 eprintln!("vigil: halt requested (SIGUSR1)");
-                shutdown_requested = true;
                 stop_scanner(scanner_pid);
                 exec_shutdown("halt");
             }
             libc::SIGUSR2 => {
                 eprintln!("vigil: poweroff requested (SIGUSR2)");
-                shutdown_requested = true;
                 stop_scanner(scanner_pid);
                 exec_shutdown("poweroff");
             }
             libc::SIGPWR => {
                 eprintln!("vigil: power failure (SIGPWR)");
-                shutdown_requested = true;
                 stop_scanner(scanner_pid);
                 exec_shutdown("poweroff");
             }

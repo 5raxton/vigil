@@ -2,7 +2,7 @@
 
 A fast, memory-safe Linux init system and process supervisor written in Rust.
 
-Vigil combines the best ideas from decades of init system design — the supervision model of daemontools/runit/s6, the dependency awareness of dinit, the socket activation of systemd, and the minimalism of sinit — into a single, coherent, auditable codebase. It keeps PID 1 small, allocates nothing in its core loop, and never polls when it can be notified.
+Vigil combines the best ideas from decades of init system design — the supervision model of daemontools/runit/s6, the dependency awareness of dinit, and the minimalism of sinit — into a single, coherent, auditable codebase. It keeps PID 1 small, allocates nothing in its core loop, and relies on a compact event loop rather than a heavyweight bus.
 
 ## Philosophy
 
@@ -10,7 +10,7 @@ Vigil is built around four guiding principles:
 
 1. **PID 1 stays small.** The actual init process only reaps zombies, routes signals, and chain-loads the scanner. All real supervision lives one level down, so a crash in a supervisor can never brick the machine — the init process restarts it (a "second-chance" model).
 2. **Everything is a process.** Services are supervised by dedicated lightweight supervisors. No single point of failure.
-3. **Ready, not spawned.** Dependencies are scheduled off *readiness*, not off `fork()`. Boot starts fast because work happens in parallel and dependents wait only for what they actually need.
+3. **Correct teardown.** `vigil-ctl stop/restart` and system shutdown terminate the whole service process tree (the service and any children it spawned), not just the supervisor — so nothing is left orphaned. Services stop in reverse dependency order.
 4. **Original, not a clone.** Vigil doesn't copy runit or s6. It takes the strongest ideas from each system and reinvents them with a clean, dependency-aware, event-driven architecture.
 
 ## Architecture
@@ -58,15 +58,30 @@ Vigil is built around four guiding principles:
 ## Features
 
 - **Dependency-aware startup** — requirement vs. ordering separated (`after` / `before` / `wants`), topological sort with cycle detection, run in dependency order for teardown.
-- **Readiness tracking** — a service isn't "up" until it signals readiness (pid, socket, signal, or exec check), so dependents start off real readiness.
+- **Boot targets** — `default_target` + per-target service enablement under `/etc/vigil/targets/`.
 - **Smart restart policy** — `always` / `on-failure` / `on-abnormal` / `never`, with exponential backoff and a restart ceiling to stop crash loops.
 - **Exponential backoff** — initial delay grows geometrically up to a cap.
 - **Resource limits** — max open files, processes, and address space per service.
 - **Per-service logging** — size- and count-based rotation via a live pipe; never lossy; never stops the service.
 - **Unix-socket control plane** — a simple, documented JSON-over-socket protocol (no D-Bus).
 - **Config reload** — `SIGHUP` or `vigil-ctl reload` reloads service definitions.
-- **Graceful teardown** — reverse-dependency order, configurable TERM→KILL grace.
-- **No dynamic allocation in supervision cores**, pure event-driven loops, zero polling.
+- **Graceful teardown** — reverse-dependency order; `stop`/`restart` SIGTERM the supervisor, which in turn terminates the service and its entire process group, then waits through the configured TERM→KILL grace.
+- **Correct service PID reporting** — `vigil-ctl status`/`list` report the real service PID (from the status dir), not the supervisor's PID.
+- **No dynamic allocation in supervision cores**, compact event-driven loops.
+
+## Implementation status
+
+The following subsystems are **fully implemented** and exercised by the control-plane and supervision code:
+
+- Process supervision with exponential backoff, restart ceiling, and per-service process-group teardown
+- Dependency-ordered start and reverse-dependency teardown
+- Boot targets (`default_target`/`target_dir`)
+- Shutdown/reboot/halt/poweroff via `vigil-ctl` (scanner signals PID 1, which performs the action)
+- Per-service logging with size/count rotation (`vigillog`)
+- Unix-socket JSON control plane (`vigil-ctl`), config reload (`SIGHUP`)
+- Resource limits (open files, processes, address space)
+
+The following fields are **reserved but not yet implemented**: `service.readiness` (pid/socket/signal/exec readiness checks), `service.resource_limits.cpu_shares` (cgroup), and socket activation (`[socket]`). They are accepted by the parser for forward-compatibility but currently have no effect; dependents in these configurations start once the supervisor has spawned the service rather than after a custom readiness check.
 
 ## Requirements
 
