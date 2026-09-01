@@ -80,6 +80,20 @@ fn mount_filesystems() {
             MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_NODEV,
             Some("mode=0755"),
         ),
+        (
+            "tmpfs",
+            "/dev/shm",
+            "tmpfs",
+            MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+            Some("mode=1777"),
+        ),
+        (
+            "devpts",
+            "/dev/pts",
+            "devpts",
+            MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
+            Some("gid=5,mode=620,ptmxmode=0666"),
+        ),
     ];
 
     for &(source, target, fstype, flags, data) in mounts {

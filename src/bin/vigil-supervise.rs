@@ -24,20 +24,26 @@ const DEFAULT_READINESS_TIMEOUT: u64 = 30_000;
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: vigil-supervise <service_name> <config_path> [log_dir]");
+        eprintln!(
+            "usage: vigil-supervise <service_name> <config_path> [log_dir] [supervise_dir]"
+        );
         exit(1);
     }
 
     let service_name = &args[1];
     let config_path = PathBuf::from(&args[2]);
     let default_log_dir = args.get(3).map(|s| s.as_str()).unwrap_or(VIGIL_LOG_DIR);
+    let default_supervise_dir = args
+        .get(4)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(VIGIL_SUPERVISE_DIR));
 
     let config_content = fs::read_to_string(&config_path)
         .with_context(|| format!("failed to read config: {}", config_path.display()))?;
     let config: ServiceConfig =
         toml::from_str(&config_content).with_context(|| "failed to parse config")?;
 
-    let supervise_dir = PathBuf::from(format!("{}/{}", VIGIL_SUPERVISE_DIR, service_name));
+    let supervise_dir = default_supervise_dir.join(service_name);
     fs::create_dir_all(&supervise_dir)?;
 
     let status_dir = supervise_dir.join("status");
@@ -924,11 +930,17 @@ fn resolve_syslog_socket(config: &ServiceConfig) -> PathBuf {
 }
 
 fn create_log_pipe(config: &ServiceConfig, service_name: &str) -> (i32, i32) {
+    use vigil::config::OutputTarget;
+
+    // Any stream routed to the log pipeline (Log, or Syslog meaning "through
+    // the configured logger") needs a pipe so output is never silently lost.
+    let any_to_log = matches!(config.service.stdout, OutputTarget::Log | OutputTarget::Syslog)
+        || matches!(config.service.stderr, OutputTarget::Log | OutputTarget::Syslog);
+
     if config.logging.kind == LogType::None
-        || (config.service.stdout == vigil::config::OutputTarget::Null
-            && config.service.stderr == vigil::config::OutputTarget::Null)
-        || (config.service.stdout != vigil::config::OutputTarget::Log
-            && config.service.stderr != vigil::config::OutputTarget::Log)
+        || (config.service.stdout == OutputTarget::Null
+            && config.service.stderr == OutputTarget::Null)
+        || !any_to_log
     {
         return (-1, -1);
     }
@@ -1129,7 +1141,10 @@ fn dup_stdio(config: &ServiceConfig, log_write: i32) {
 
     for (stream_fd, target) in [(1, &config.service.stdout), (2, &config.service.stderr)] {
         match target {
-            OutputTarget::Log => {
+            // `Syslog` on an individual stream means "send it through the
+            // configured logger" (which for logging.kind=syslog reaches
+            // syslog); otherwise fall back to the log pipe like `Log`.
+            OutputTarget::Log | OutputTarget::Syslog => {
                 if log_write >= 0 {
                     let _ = nix::unistd::dup2(log_write, stream_fd);
                 } else {
@@ -1143,9 +1158,6 @@ fn dup_stdio(config: &ServiceConfig, log_write: i32) {
                 if stream_fd == 2 {
                     let _ = nix::unistd::dup2(1, 2);
                 }
-            }
-            OutputTarget::Syslog => {
-                redirect_to_dev_null(stream_fd, libc::O_WRONLY);
             }
         }
     }

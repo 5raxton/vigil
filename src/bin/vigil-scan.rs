@@ -135,6 +135,15 @@ impl Scanner {
                     .unwrap_or("unknown")
                     .to_string();
 
+                if !is_valid_service_name(&name) {
+                    eprintln!(
+                        "vigil-scan: skipping '{}' (invalid service name; must be alphanumeric, \
+                         '.', '_' or '-')",
+                        path.display()
+                    );
+                    continue;
+                }
+
                 match fs::read_to_string(&path) {
                     Ok(content) => match toml::from_str::<ServiceConfig>(&content) {
                         Ok(config) => {
@@ -417,12 +426,21 @@ impl Scanner {
                     CString::new(state.config_path.to_string_lossy().to_string()).unwrap();
                 let log_dir_c =
                     CString::new(self.config.log_dir.to_string_lossy().to_string()).unwrap();
+                let supervise_dir_c = CString::new(
+                    self.config
+                        .runtime_dir
+                        .join("supervise")
+                        .to_string_lossy()
+                        .to_string(),
+                )
+                .unwrap();
 
                 let argv: Vec<CString> = vec![
                     CString::new("vigil-supervise").unwrap(),
                     service_name_c,
                     config_path_c,
                     log_dir_c,
+                    supervise_dir_c,
                 ];
 
                 for path in vigil::util::exec_search_paths("vigil-supervise") {
@@ -1089,4 +1107,16 @@ fn read_log_lines(path: &Path, max_lines: usize) -> Result<Vec<String>> {
             return Ok(parts[start..].iter().map(|s| s.to_string()).collect());
         }
     }
+}
+
+/// Service names are used to build filesystem paths (supervise/status/log
+/// dirs) and cgroup names, so they must be restricted to a safe identifier
+/// set. Rejecting anything else prevents path traversal / directory escapes
+/// via a maliciously-named service file.
+fn is_valid_service_name(name: &str) -> bool {
+    if name.is_empty() || name == "." || name == ".." {
+        return false;
+    }
+    name.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
 }
