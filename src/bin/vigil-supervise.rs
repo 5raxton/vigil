@@ -1155,7 +1155,13 @@ fn run_service_child(
 
     // Socket activation: relocate the listening descriptors into the fixed
     // `LISTEN_FDS_START`.. range so services see a stable, systemd-style
-    // environment (`LISTEN_FDS`/`LISTEN_PID`).
+    // environment (`LISTEN_FDS`/`LISTEN_PID`). The sockets were created by
+    // std (`TcpListener`/`UdpSocket`/`UnixListener`) which marks them
+    // FD_CLOEXEC by default, so we must explicitly clear that flag on the
+    // final descriptor — otherwise the kernel silently closes every listen
+    // fd at exec and the service gets `LISTEN_FDS=N` with no actual
+    // descriptors (and, when the original fd already equals `target`, the
+    // `fd != target` branch that would have dup2'd away CLOEXEC is skipped).
     for (i, &fd) in listen_fds.iter().enumerate() {
         let target = LISTEN_FDS_START + i as i32;
         unsafe {
@@ -1163,6 +1169,7 @@ fn run_service_child(
                 libc::dup2(fd, target);
                 libc::close(fd);
             }
+            libc::fcntl(target, libc::F_SETFD, 0);
         }
     }
 
