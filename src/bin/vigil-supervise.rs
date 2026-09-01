@@ -1086,6 +1086,28 @@ fn run_service_child(
         libc::setpgid(0, 0);
     }
 
+    // Guarantee the service never survives a crash of its supervisor (the
+    // "second chance" model respawns the supervisor, which would otherwise
+    // leave the old service orphaned under PID 1 as a duplicate). When the
+    // parent (supervisor) dies unexpectedly, the kernel SIGKILLs this process,
+    // so a crashed supervisor cannot leak a running service.
+    //
+    // The classic race here is the supervisor dying *between* fork and
+    // PR_SET_PDEATHSIG: PDEATHSIG then never fires and getppid() reports the
+    // reparenting reaper. We therefore re-check the parent PID after setting
+    // it and terminate ourselves if the supervisor is already gone.
+    let supervisor_pid = unsafe { libc::getppid() };
+    unsafe {
+        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
+    }
+    if unsafe { libc::getppid() } != supervisor_pid {
+        eprintln!(
+            "vigil-supervise [{}]: supervisor exited during spawn; aborting service",
+            service_name
+        );
+        exit(1);
+    }
+
     reset_signal_mask();
 
     // Services must not die because the logging pipeline broke (e.g. vigillog
