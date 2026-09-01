@@ -442,9 +442,9 @@ fn supervise_child(
         // Record the service as running (with its real PID) exactly once, as
         // soon as it is ready. This covers the `none` readiness kind, which
         // otherwise never wrote the state/pid, and any kind that just became
-        // ready above.
-        if ready && !ready_recorded {
-            let _ = writeln_state(status_dir, "running", Some(child_pid_raw as u32));
+        // ready above. The write is retried until it succeeds so a transient
+        // status-dir error cannot leave the service stranded in `starting`.
+        if ready && !ready_recorded && writeln_state(status_dir, "running", Some(child_pid_raw as u32)).is_ok() {
             ready_recorded = true;
         }
 
@@ -1050,6 +1050,14 @@ fn run_service_child(
     }
 
     reset_signal_mask();
+
+    // Services must not die because the logging pipeline broke (e.g. vigillog
+    // failed to spawn and the log pipe has no reader). Match systemd's default
+    // `IgnoreSIGPIPE=yes`: install SIGPIPE-as-ignored so a closed log pipe
+    // yields EPIPE on write rather than terminating the service.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
 
     if let Err(e) = prepare_service_environment(config) {
         eprintln!(

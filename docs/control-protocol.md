@@ -16,7 +16,7 @@ Every message is:
 - Requests and Responses are serialized `enum`s; an unknown variant is a
   protocol error and the connection is closed.
 - On success the scanner accepts the connection; there is no auth beyond Unix
-  socket permissions (chmod 0660, root by default).
+  socket permissions (chmod 0600, root by default).
 
 ## Requests → Responses
 
