@@ -1027,7 +1027,14 @@ fn spawn_logger(
     let mut argv: Vec<CString> = Vec::with_capacity(raw_args.len() + 1);
     argv.push(CString::new("vigillog").unwrap());
     for arg in &raw_args {
-        argv.push(CString::new(arg.as_str()).unwrap());
+        // A NUL smuggled into a config path must not panic (abort) the
+        // supervisor; reject it with a clean error instead.
+        argv.push(CString::new(arg.as_str()).map_err(|_| {
+            anyhow::anyhow!(
+                "vigillog argument for '{}' contains a NUL byte",
+                service_name
+            )
+        })?);
     }
 
     match unsafe { fork() } {

@@ -409,6 +409,21 @@ impl Scanner {
         let status_dir = supervise_dir.join("status");
         fs::create_dir_all(&status_dir)?;
 
+        // Build the exec arguments up front (in the parent) so a malformed
+        // config value (e.g. a NUL byte smuggled into log_dir/runtime_dir)
+        // is rejected with a clean error rather than panicking — with
+        // `panic = "abort"` a panic would take down the whole supervisor.
+        let service_name_c = to_cstring(name, "service name")?;
+        let config_path_c = to_cstring(
+            &state.config_path.to_string_lossy(),
+            "config path",
+        )?;
+        let log_dir_c = to_cstring(&self.config.log_dir.to_string_lossy(), "log dir")?;
+        let supervise_dir_c = to_cstring(
+            &self.config.runtime_dir.join("supervise").to_string_lossy(),
+            "supervise dir",
+        )?;
+
         match unsafe { fork() } {
             Ok(ForkResult::Parent { child }) => {
                 eprintln!(
@@ -421,20 +436,6 @@ impl Scanner {
                 Ok(())
             }
             Ok(ForkResult::Child) => {
-                let service_name_c = CString::new(name.to_string()).unwrap();
-                let config_path_c =
-                    CString::new(state.config_path.to_string_lossy().to_string()).unwrap();
-                let log_dir_c =
-                    CString::new(self.config.log_dir.to_string_lossy().to_string()).unwrap();
-                let supervise_dir_c = CString::new(
-                    self.config
-                        .runtime_dir
-                        .join("supervise")
-                        .to_string_lossy()
-                        .to_string(),
-                )
-                .unwrap();
-
                 let argv: Vec<CString> = vec![
                     CString::new("vigil-supervise").unwrap(),
                     service_name_c,
@@ -1069,6 +1070,12 @@ impl Scanner {
         eprintln!("vigil-scan: shutdown complete");
         Ok(())
     }
+}
+
+/// Build a NUL-terminated C string, returning a clean error (instead of
+/// panicking / aborting) when the input contains an embedded NUL byte.
+fn to_cstring(value: &str, what: &str) -> Result<CString> {
+    CString::new(value).with_context(|| format!("{} contains a NUL byte", what))
 }
 
 fn read_log_lines(path: &Path, max_lines: usize) -> Result<Vec<String>> {
