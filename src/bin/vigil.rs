@@ -197,7 +197,14 @@ fn run_init_loop() {
                             scanner_pid = Some(spawn_scanner());
                         }
                         Err(nix::errno::Errno::ECHILD) => {
+                            // The scanner was already reaped above (or its
+                            // exit status arrived after the generic reap): it
+                            // is gone regardless. Without this branch the old
+                            // supervisors it left behind would keep running
+                            // under PID 1 while a fresh scanner starts a
+                            // second copy of every service.
                             eprintln!("vigil: scanner gone, restarting");
+                            kill_all_children();
                             scanner_pid = Some(spawn_scanner());
                         }
                         Err(_) => {}
