@@ -23,7 +23,11 @@ vigil (PID 1)
   reaps it, checks its status dir to decide whether the service was alive
   ("second chance"), and respawns the supervisor (not the service). This is the
   same relationship `vigil` has with `vigil-scan`. A crash in any one process
-  therefore never takes down the machine or unrelated services.
+  therefore never takes down the machine or unrelated services. Each service is
+  started with `PR_SET_PDEATHSIG(SIGKILL)`, so a supervisor that dies (even
+  mid-run, e.g. SIGKILLed or panicking) takes its service with it — a respawned
+  supervisor always starts a fresh service and can never leave an orphaned
+  duplicate of the old one running under a reaper.
 
 ## Privilege separation
 
@@ -82,7 +86,7 @@ remapped to `3..n` with:
 
 - `LISTEN_FDS` = number of descriptors,
 - `LISTEN_PID` = the child PID,
-- `VIGIL_SOCK` = `supervisor=<pid>`.
+- `VIGIL_SUPERVISOR_PID` = the supervising process's PID.
 
 This matches the systemd convention, so unmodified systemd-aware daemons (sshd,
 systemd socket services) accept the descriptors. Unix socket paths are unlinked

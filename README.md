@@ -67,7 +67,7 @@ Vigil is built around four guiding principles:
 - **Socket activation** — `[socket]` listen specs (TCP/UDP/Unix) are bound by the supervisor *before* exec and handed to the service as descriptors `3..n` with the standard `LISTEN_FDS`/`LISTEN_PID` environment, so daemons like sshd start instantly and bind only once.
 - **cgroup v2 CPU shares** — `resource_limits.cpu_shares` maps to the `cpu.weight` controller (systemd's canonical `shares → weight` mapping); the supervisor silently skips it when cgroup v2 is unavailable rather than failing the boot.
 - **Smart restart policy** — `always` / `on-failure` / `on-abnormal` / `never`, with exponential backoff and a restart ceiling to stop crash loops.
-- **Supervisor resilience** — a crashed supervisor is detected and respawned (a "second chance"), so one bad supervisor can never take down unrelated services; PID 1 likewise restarts the scanner if it ever dies.
+- **Supervisor resilience** — a crashed supervisor is detected and respawned (a "second chance"), so one bad supervisor can never take down unrelated services; PID 1 likewise restarts the scanner if it ever dies. Services are started under `PR_SET_PDEATHSIG(SIGKILL)`, so a supervisor that dies mid-run takes its service with it and a respawned supervisor starts a fresh instance — no orphaned duplicates.
 - **Resource limits** — max open files, processes, address space, and cgroup CPU shares per service, applied with `setrlimit` before dropping privileges.
 - **Privilege drop** — services run as the configured `user`/`group` (primary group fallback, supplementary groups re-initialized via `initgroups`).
 - **Per-service logging** — three real modes: `pipe` (live pipeline into size/count-rotated files), `file` (supervisor opens/rotates the file directly), and `syslog` (RFC 3164 messages to `/dev/log`), plus `none`. Never lossy; never stops the service.
@@ -195,7 +195,7 @@ Readiness semantics:
 | `signal` | the service raises the signal from `signal` (default `USR1`); collisions with `TERM`/`INT`/`HUP` are rejected |
 | `exec`   | `/bin/sh -c check` exits 0 within the per-run cap |
 
-Socket activation follows the systemd convention: the supervisor binds every `[socket]` listen spec before exec, remaps the descriptors to `3..n` in the child, and exports `LISTEN_FDS`, `LISTEN_PID`, and `VIGIL_SOCK` (`supervisor=<pid>`). Hosts in listen specs must be IP literals — name resolution is deliberately avoided at boot.
+Socket activation follows the systemd convention: the supervisor binds every `[socket]` listen spec before exec, remaps the descriptors to `3..n` in the child, and exports `LISTEN_FDS` and `LISTEN_PID`. It also sets `VIGIL_SUPERVISOR_PID` to the supervisor's PID so a service can signal/report back to its manager. Hosts in listen specs must be IP literals — name resolution is deliberately avoided at boot.
 
 ### Targets (`/etc/vigil/targets/<target>.toml`)
 
