@@ -15,6 +15,15 @@ use vigil::config::{GlobalConfig, LogType, ServiceConfig, TargetConfig};
 use vigil::dep::DepGraph;
 use vigil::protocol::{self, Request, Response, ServiceInfo, ServiceStatus};
 
+/// A supervisor that survived this long resets the crash budget, mirroring
+/// the supervisor-side backoff cooldown so a long-stable service is never
+/// refused a respawn because of an ancient crash loop.
+const RESPAWN_COOLDOWN: Duration = Duration::from_secs(600);
+/// There is no SIGKILL'able control-client timeout worth waiting for: a
+/// control request is tiny and arrives in one write, so a client that stalls
+/// mid-request is handled quickly to keep child reaping timely.
+const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
 struct ServiceState {
     config: ServiceConfig,
     config_path: PathBuf,
@@ -23,6 +32,7 @@ struct ServiceState {
     restart_count: u32,
     start_time: Option<Instant>,
     enabled: bool,
+    last_respawn: Option<Instant>,
 }
 
 struct Scanner {
@@ -80,11 +90,36 @@ fn main() -> Result<()> {
 }
 
 fn load_global_config() -> Result<GlobalConfig> {
-    let config_path = "/etc/vigil/vigil.toml";
-    if Path::new(config_path).exists() {
-        let content = fs::read_to_string(config_path).context("failed to read vigil.toml")?;
+    let mut config_path: Option<PathBuf> = None;
+
+    let mut args = std::env::args();
+    let _program = args.next();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-c" | "--config" => {
+                let value = args
+                    .next()
+                    .context("--config requires a path argument")?;
+                config_path = Some(PathBuf::from(value));
+            }
+            other => anyhow::bail!("unsupported vigil-scan argument '{}'", other),
+        }
+    }
+
+    // Precedence: an explicit --config beats VIGIL_CONFIG, which beats the
+    // compiled-in default path.
+    let config_path = match config_path {
+        Some(p) => p,
+        None => std::env::var_os("VIGIL_CONFIG")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/etc/vigil/vigil.toml")),
+    };
+
+    if Path::new(&config_path).exists() {
+        let content = fs::read_to_string(&config_path)
+            .with_context(|| format!("failed to read {}", config_path.display()))?;
         let config: GlobalConfig =
-            toml::from_str(&content).context("failed to parse vigil.toml")?;
+            toml::from_str(&content).with_context(|| "failed to parse vigil.toml")?;
         Ok(config)
     } else {
         Ok(GlobalConfig::default())
@@ -158,6 +193,7 @@ impl Scanner {
                                     restart_count: 0,
                                     start_time: None,
                                     enabled: true,
+                                    last_respawn: None,
                                 },
                             );
                         }
@@ -576,14 +612,22 @@ impl Scanner {
                     .contains(nix::poll::PollFlags::POLLIN)
             {
                 if let Some(ref listener) = self.control_listener {
-                    match listener.accept() {
-                        Ok((stream, _)) => {
-                            self.handle_control_connection(stream);
+                    // Drain every pending connection (not just one) so a
+                    // burst of control requests cannot push child reaping
+                    // behind an ever-growing accept queue.
+                    let mut streams = Vec::new();
+                    loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => streams.push(stream),
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(e) => {
+                                eprintln!("vigil-scan: accept error: {}", e);
+                                break;
+                            }
                         }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                        Err(e) => {
-                            eprintln!("vigil-scan: accept error: {}", e);
-                        }
+                    }
+                    for stream in streams {
+                        self.handle_control_connection(stream);
                     }
                 }
             }
@@ -657,7 +701,20 @@ impl Scanner {
                                 && was_supervising
                                 && state.restart_count < state.config.service.restart.max_restarts
                             {
-                                state.restart_count += 1;
+                                // The crash counter decays: a supervisor that
+                                // survived RESPAWN_COOLDOWN resets the budget
+                                // rather than carrying an old crash loop
+                                // against a long-stable service.
+                                let cooldown_elapsed = state
+                                    .last_respawn
+                                    .map(|t| t.elapsed() >= RESPAWN_COOLDOWN)
+                                    .unwrap_or(true);
+                                state.restart_count = if cooldown_elapsed {
+                                    1
+                                } else {
+                                    state.restart_count.saturating_add(1)
+                                };
+                                state.last_respawn = Some(Instant::now());
                                 respawn = true;
                             } else {
                                 state.restart_count = 0;
@@ -781,9 +838,8 @@ impl Scanner {
     }
 
     fn handle_control_connection(&mut self, mut stream: UnixStream) {
-        let timeout = Duration::from_secs(15);
-        stream.set_read_timeout(Some(timeout)).ok();
-        stream.set_write_timeout(Some(timeout)).ok();
+        stream.set_read_timeout(Some(CONTROL_READ_TIMEOUT)).ok();
+        stream.set_write_timeout(Some(CONTROL_READ_TIMEOUT)).ok();
 
         let request: Request = match protocol::read_message(&mut stream) {
             Ok(r) => r,
@@ -1004,6 +1060,7 @@ impl Scanner {
                     state.supervisor_pid = old_state.supervisor_pid;
                     state.restart_count = old_state.restart_count;
                     state.start_time = old_state.start_time;
+                    state.last_respawn = old_state.last_respawn;
                 }
             }
         }

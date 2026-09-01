@@ -54,6 +54,18 @@ fn main() -> Result<()> {
         service_name
     );
 
+    // An empty command would exec-fail in a tight loop; surface it loudly
+    // instead. Record "failed" first so vigil-scan treats this as a
+    // supervisor that gave up rather than one that crashed (which would
+    // trigger pointless respawns).
+    if config.service.command.trim().is_empty() {
+        let _ = writeln_state(&status_dir, "failed", None);
+        anyhow::bail!(
+            "vigil-supervise [{}]: service.command is empty",
+            service_name
+        );
+    }
+
     block_stop_signals(&config)?;
 
     // Validate the configured shutdown/kill signal names so a typo surfaces
