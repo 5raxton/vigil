@@ -98,7 +98,7 @@ before bind so a crashed prior instance cannot wedge the path.
 the canonical systemd mapping `weight = 1 + shares * 9999 / 2^18`, clamped to
 the kernel's `[1, 10000]` range. The supervisor walks `/sys/fs/cgroup`, writes
 the weight into `cpu.weight`, and relocates the service into the new
-`vigil-<name>.scope` child cgroup so the daemon can keep managing its own
+`vigil/<name>` child cgroup so the daemon can keep managing its own
 subtree. When cgroup v2 is absent (hosted kernels, early boot before cgroupfs
 mount) the whole step is skipped with a log line — resource limits must never
 be able to fail a boot.

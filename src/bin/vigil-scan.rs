@@ -23,6 +23,10 @@ const RESPAWN_COOLDOWN: Duration = Duration::from_secs(600);
 /// control request is tiny and arrives in one write, so a client that stalls
 /// mid-request is handled quickly to keep child reaping timely.
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upper bound on log lines returned by a single `Log` request. The wire cap
+/// is 16 MiB, so this keeps a runaway `-n` argument from ballooning the
+/// response (or the client's allocation) with no real benefit.
+const MAX_LOG_LINES: usize = 10_000;
 
 struct ServiceState {
     config: ServiceConfig,
@@ -97,9 +101,7 @@ fn load_global_config() -> Result<GlobalConfig> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-c" | "--config" => {
-                let value = args
-                    .next()
-                    .context("--config requires a path argument")?;
+                let value = args.next().context("--config requires a path argument")?;
                 config_path = Some(PathBuf::from(value));
             }
             other => anyhow::bail!("unsupported vigil-scan argument '{}'", other),
@@ -450,10 +452,7 @@ impl Scanner {
         // is rejected with a clean error rather than panicking — with
         // `panic = "abort"` a panic would take down the whole supervisor.
         let service_name_c = to_cstring(name, "service name")?;
-        let config_path_c = to_cstring(
-            &state.config_path.to_string_lossy(),
-            "config path",
-        )?;
+        let config_path_c = to_cstring(&state.config_path.to_string_lossy(), "config path")?;
         let log_dir_c = to_cstring(&self.config.log_dir.to_string_lossy(), "log dir")?;
         let supervise_dir_c = to_cstring(
             &self.config.runtime_dir.join("supervise").to_string_lossy(),
@@ -546,7 +545,17 @@ impl Scanner {
     fn open_control_socket(&mut self) -> Result<()> {
         let _ = fs::remove_file(&self.config.control_socket);
 
-        let listener = UnixListener::bind(&self.config.control_socket).with_context(|| {
+        // Bind under a restrictive umask so the socket file is private from
+        // the moment it is created. Doing the chmod only after bind leaves a
+        // tiny window during which the socket node exists with the process
+        // umask's permissions (typically 0755), letting a local user connect
+        // before it is locked down.
+        let old_umask = unsafe { libc::umask(0o077) };
+        let bind_result = UnixListener::bind(&self.config.control_socket);
+        unsafe {
+            libc::umask(old_umask);
+        }
+        let listener = bind_result.with_context(|| {
             format!(
                 "failed to bind control socket: {}",
                 self.config.control_socket.display()
@@ -555,11 +564,9 @@ impl Scanner {
 
         listener.set_nonblocking(true)?;
 
-        // Restrict the control socket to root (mode 0600). Without an explicit
-        // chmod the socket would inherit the process umask (typically 022),
-        // leaving it writable by any local user — who could then start/stop
-        // services or trigger a reboot/poweroff. The default umask can be
-        // changed, so always force the safe mode here.
+        // Restrict the control socket to root (mode 0600). The umask above is
+        // a tighten-the-window measure; this chmod is the authoritative,
+        // umask-independent guarantee that survives the whole socket lifetime.
         let path = CString::new(self.config.control_socket.as_os_str().as_encoded_bytes())?;
         if unsafe { libc::chmod(path.as_ptr(), 0o600) } != 0 {
             anyhow::bail!(
@@ -989,7 +996,7 @@ impl Scanner {
             }
 
             Request::Log { service, lines } => match self.log_file_for(&service) {
-                Some(log_path) => match read_log_lines(&log_path, lines) {
+                Some(log_path) => match read_log_lines(&log_path, lines.min(MAX_LOG_LINES)) {
                     Ok(log_lines) => Response::LogLines(log_lines),
                     Err(e) => Response::Error {
                         message: format!("failed to read logs for '{}': {}", service, e),
@@ -1051,7 +1058,10 @@ impl Scanner {
         // Services that were removed from the configuration are torn down.
         for (name, old_state) in &old_services {
             if !new_names.contains(name) {
-                eprintln!("vigil-scan: service '{}' removed from config, stopping", name);
+                eprintln!(
+                    "vigil-scan: service '{}' removed from config, stopping",
+                    name
+                );
                 if let Some(pid) = old_state.supervisor_pid {
                     unsafe {
                         libc::kill(pid as i32, libc::SIGTERM);
@@ -1089,7 +1099,10 @@ impl Scanner {
             .map(|(n, _)| n.clone())
             .collect();
         for name in to_stop {
-            eprintln!("vigil-scan: service '{}' disabled on reload, stopping", name);
+            eprintln!(
+                "vigil-scan: service '{}' disabled on reload, stopping",
+                name
+            );
             if let Err(e) = self.stop_service(&name) {
                 eprintln!("vigil-scan: failed to stop '{}' on reload: {}", name, e);
             }

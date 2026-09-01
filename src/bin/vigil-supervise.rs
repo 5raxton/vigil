@@ -21,9 +21,7 @@ use vigil::{
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
-        eprintln!(
-            "usage: vigil-supervise <service_name> <config_path> [log_dir] [supervise_dir]"
-        );
+        eprintln!("usage: vigil-supervise <service_name> <config_path> [log_dir] [supervise_dir]");
         exit(1);
     }
 
@@ -45,6 +43,14 @@ fn main() -> Result<()> {
 
     let status_dir = supervise_dir.join("status");
     fs::create_dir_all(&status_dir)?;
+
+    // A previous supervisor instance may have left a "restarts" file behind
+    // (it is written only on the first restart, via save_restart_count). We
+    // are a brand-new supervisor with a fresh restart budget: resetting the
+    // counter to 0 here keeps the restarts file owned by the instance that
+    // actually accrued the crashes, so the scanner never reports a stale
+    // count for a service that has not crashed since respawn.
+    let _ = fs::write(status_dir.join("restarts"), "0");
 
     eprintln!(
         "vigil-supervise [{}]: starting service supervisor",
@@ -69,7 +75,11 @@ fn main() -> Result<()> {
     // loudly at startup instead of silently degrading teardown (e.g. a
     // mistyped `kill_signal = "KILLL"` falling back to SIGTERM and potentially
     // never force-killing a stuck process).
-    validate_signal_name(&config.service.shutdown.signal, "shutdown.signal", service_name)?;
+    validate_signal_name(
+        &config.service.shutdown.signal,
+        "shutdown.signal",
+        service_name,
+    )?;
     validate_signal_name(
         &config.service.shutdown.kill_signal,
         "shutdown.kill_signal",
@@ -140,7 +150,13 @@ fn main() -> Result<()> {
         }
 
         let vigillog_pid = if log_read >= 0 {
-            match spawn_logger(&config, default_log_dir, service_name, log_read, &listen_fds) {
+            match spawn_logger(
+                &config,
+                default_log_dir,
+                service_name,
+                log_read,
+                &listen_fds,
+            ) {
                 Ok(pid) => Some(pid),
                 Err(e) => {
                     eprintln!(
@@ -453,7 +469,10 @@ fn supervise_child(
         // otherwise never wrote the state/pid, and any kind that just became
         // ready above. The write is retried until it succeeds so a transient
         // status-dir error cannot leave the service stranded in `starting`.
-        if ready && !ready_recorded && writeln_state(status_dir, "running", Some(child_pid_raw as u32)).is_ok() {
+        if ready
+            && !ready_recorded
+            && writeln_state(status_dir, "running", Some(child_pid_raw as u32)).is_ok()
+        {
             ready_recorded = true;
         }
 
@@ -972,8 +991,13 @@ fn create_log_pipe(config: &ServiceConfig, service_name: &str) -> (i32, i32) {
 
     // Any stream routed to the log pipeline (Log, or Syslog meaning "through
     // the configured logger") needs a pipe so output is never silently lost.
-    let any_to_log = matches!(config.service.stdout, OutputTarget::Log | OutputTarget::Syslog)
-        || matches!(config.service.stderr, OutputTarget::Log | OutputTarget::Syslog);
+    let any_to_log = matches!(
+        config.service.stdout,
+        OutputTarget::Log | OutputTarget::Syslog
+    ) || matches!(
+        config.service.stderr,
+        OutputTarget::Log | OutputTarget::Syslog
+    );
 
     if config.logging.kind == LogType::None
         || (config.service.stdout == OutputTarget::Null
@@ -1285,9 +1309,7 @@ fn apply_resource_limits(config: &ServiceConfig) -> Result<()> {
         setrlimit(Resource::RLIMIT_NPROC, max_procs, max_procs)?;
     }
     if let Some(max_memory) = config.service.resource_limits.max_memory_mb {
-        let bytes = max_memory
-            .saturating_mul(1024)
-            .saturating_mul(1024);
+        let bytes = max_memory.saturating_mul(1024).saturating_mul(1024);
         setrlimit(Resource::RLIMIT_AS, bytes, bytes)?;
     }
     Ok(())
@@ -1565,8 +1587,7 @@ mod tests {
             "#,
         );
         let rc = &cfg.service.readiness;
-        let mut probe =
-            ReadinessProbe::new(rc, "test", socket_readiness_target(&cfg));
+        let mut probe = ReadinessProbe::new(rc, "test", socket_readiness_target(&cfg));
         assert!(
             matches!(probe.tick(), ProbeResult::Pending),
             "signal readiness must wait for the signal, not the probe"
@@ -1589,8 +1610,7 @@ mod tests {
             "#,
         );
         let rc = &cfg.service.readiness;
-        let mut probe =
-            ReadinessProbe::new(rc, "test", socket_readiness_target(&cfg));
+        let mut probe = ReadinessProbe::new(rc, "test", socket_readiness_target(&cfg));
         assert!(probe.invalid.is_none(), "probe should not be invalid");
         assert!(matches!(probe.kind, ReadinessType::Socket));
         assert!(probe.spec.is_some(), "socket probe should carry a target");
@@ -1610,8 +1630,7 @@ mod tests {
             "#,
         );
         let rc = &cfg.service.readiness;
-        let mut probe =
-            ReadinessProbe::new(rc, "test", socket_readiness_target(&cfg));
+        let mut probe = ReadinessProbe::new(rc, "test", socket_readiness_target(&cfg));
         assert!(probe.invalid.is_some());
         assert!(matches!(probe.tick(), ProbeResult::Failed(_)));
     }

@@ -102,8 +102,12 @@ impl Drop for TestScan {
 fn roundtrip(sock: &Path, req: &Request) -> Response {
     let mut stream = UnixStream::connect(sock)
         .unwrap_or_else(|e| panic!("connect to {} failed: {}", sock.display(), e));
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    stream.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
     protocol::write_message(&mut stream, req).unwrap();
     protocol::read_message(&mut stream).unwrap()
 }
@@ -113,8 +117,12 @@ fn roundtrip(sock: &Path, req: &Request) -> Response {
 fn wait_for_control_socket(sock: &Path, deadline: Instant) {
     loop {
         if let Ok(mut stream) = UnixStream::connect(sock) {
-            stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-            stream.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
             protocol::write_message(&mut stream, &Request::Ping).unwrap();
             if let Ok(Response::Pong) = protocol::read_message(&mut stream) {
                 return;
@@ -129,20 +137,12 @@ fn wait_for_control_socket(sock: &Path, deadline: Instant) {
 }
 
 /// Poll `pred` until it returns `Some`, panicking once `deadline` passes.
-fn wait_until<T>(
-    label: &str,
-    deadline: Instant,
-    mut pred: impl FnMut() -> Option<T>,
-) -> Option<T> {
+fn wait_until<T>(label: &str, deadline: Instant, mut pred: impl FnMut() -> Option<T>) -> Option<T> {
     loop {
         if let Some(value) = pred() {
             return Some(value);
         }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {}",
-            label
-        );
+        assert!(Instant::now() < deadline, "timed out waiting for {}", label);
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -167,37 +167,47 @@ fn control_plane_lifecycle() {
     );
 
     // status: the service should come up with its real pid recorded.
-    let first_pid: Option<u32> = wait_until("echosvc running", deadline, || match roundtrip(
-        &sock,
-        &Request::Status {
-            service: Some("echosvc".into()),
-        },
-    ) {
-        Response::Status(s) if s.state == "running" && s.pid.is_some() => s.pid,
-        Response::Status(s) => {
-            assert_ne!(s.state, "failed", "echosvc failed to start");
-            None
-        }
-        other => panic!("unexpected status response: {other:?}"),
-    });
-
-    // restart: a new pid replaces the old one, proving the old instance was
-    // torn down (terminate_tree waits for the whole process group).
-    match roundtrip(&sock, &Request::Restart { service: "echosvc".into() }) {
-        Response::Ok { .. } => {}
-        other => panic!("unexpected restart response: {other:?}"),
-    }
-    let new_pid: Option<u32> = wait_until("echosvc running after restart", deadline, || {
+    let first_pid: Option<u32> = wait_until("echosvc running", deadline, || {
         match roundtrip(
             &sock,
             &Request::Status {
                 service: Some("echosvc".into()),
             },
         ) {
-            Response::Status(s) if s.state == "running" => s.pid,
-            _ => None,
+            Response::Status(s) if s.state == "running" && s.pid.is_some() => s.pid,
+            Response::Status(s) => {
+                assert_ne!(s.state, "failed", "echosvc failed to start");
+                None
+            }
+            other => panic!("unexpected status response: {other:?}"),
         }
     });
+
+    // restart: a new pid replaces the old one, proving the old instance was
+    // torn down (terminate_tree waits for the whole process group).
+    match roundtrip(
+        &sock,
+        &Request::Restart {
+            service: "echosvc".into(),
+        },
+    ) {
+        Response::Ok { .. } => {}
+        other => panic!("unexpected restart response: {other:?}"),
+    }
+    let new_pid: Option<u32> =
+        wait_until(
+            "echosvc running after restart",
+            deadline,
+            || match roundtrip(
+                &sock,
+                &Request::Status {
+                    service: Some("echosvc".into()),
+                },
+            ) {
+                Response::Status(s) if s.state == "running" => s.pid,
+                _ => None,
+            },
+        );
     assert!(
         new_pid.is_some() && new_pid != first_pid,
         "restart did not replace the service pid (old {:?}, new {:?})",
@@ -224,23 +234,35 @@ fn control_plane_lifecycle() {
     }
 
     // stop: supervisor + service shutdown; state falls back to stopped.
-    match roundtrip(&sock, &Request::Stop { service: "echosvc".into() }) {
+    match roundtrip(
+        &sock,
+        &Request::Stop {
+            service: "echosvc".into(),
+        },
+    ) {
         Response::Ok { .. } => {}
         other => panic!("unexpected stop response: {other:?}"),
     }
-    wait_until("echosvc stopped", deadline, || match roundtrip(
-        &sock,
-        &Request::Status {
-            service: Some("echosvc".into()),
-        },
-    ) {
-        Response::Status(s) if s.state == "stopped" => Some(()),
-        Response::Status(s) if s.state == "failed" => panic!("echosvc failed on stop"),
-        _ => None,
+    wait_until("echosvc stopped", deadline, || {
+        match roundtrip(
+            &sock,
+            &Request::Status {
+                service: Some("echosvc".into()),
+            },
+        ) {
+            Response::Status(s) if s.state == "stopped" => Some(()),
+            Response::Status(s) if s.state == "failed" => panic!("echosvc failed on stop"),
+            _ => None,
+        }
     });
 
     // start from the control plane brings it back up with a fresh pid.
-    match roundtrip(&sock, &Request::Start { service: "echosvc".into() }) {
+    match roundtrip(
+        &sock,
+        &Request::Start {
+            service: "echosvc".into(),
+        },
+    ) {
         Response::Ok { .. } => {}
         other => panic!("unexpected start response: {other:?}"),
     }
@@ -259,34 +281,37 @@ fn control_plane_lifecycle() {
         Response::Ok { .. } => {}
         other => panic!("unexpected reload response: {other:?}"),
     }
-    wait_until("echosvc running after reload", deadline, || match roundtrip(
-        &sock,
-        &Request::Status {
-            service: Some("echosvc".into()),
+    wait_until(
+        "echosvc running after reload",
+        deadline,
+        || match roundtrip(
+            &sock,
+            &Request::Status {
+                service: Some("echosvc".into()),
+            },
+        ) {
+            Response::Status(s) if s.state == "running" => Some(()),
+            _ => None,
         },
-    ) {
-        Response::Status(s) if s.state == "running" => Some(()),
-        _ => None,
-    });
+    );
 
     // graceful shutdown: SIGTERM -> event loop exits -> all services stopped
     // and the control socket is removed.
     unsafe {
         libc::kill(scan.child.id() as i32, libc::SIGTERM);
     }
-    let status = wait_until("vigil-scan exit", deadline, || match scan.child.try_wait() {
-        Ok(Some(status)) => Some(status),
-        Ok(None) => None,
-        Err(e) => panic!("wait error: {e}"),
+    let status = wait_until("vigil-scan exit", deadline, || {
+        match scan.child.try_wait() {
+            Ok(Some(status)) => Some(status),
+            Ok(None) => None,
+            Err(e) => panic!("wait error: {e}"),
+        }
     });
     assert!(
         status.expect("vigil-scan exited").success(),
         "vigil-scan exited with {status:?}"
     );
-    assert!(
-        !sock.exists(),
-        "control socket not removed after shutdown"
-    );
+    assert!(!sock.exists(), "control socket not removed after shutdown");
 
     println!("e2e control plane lifecycle OK");
 }

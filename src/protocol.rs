@@ -65,7 +65,7 @@ pub fn read_message<T: for<'de> Deserialize<'de>>(
     stream.read_exact(&mut len_buf)?;
     let len = u32::from_le_bytes(len_buf) as usize;
 
-    if len > 1024 * 1024 {
+    if len > 16 * 1024 * 1024 {
         anyhow::bail!("message too large: {} bytes", len);
     }
 

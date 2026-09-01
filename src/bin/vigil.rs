@@ -416,9 +416,15 @@ fn exec_shutdown(action: &str) -> ! {
     }
 
     eprintln!("vigil: executing reboot(2) syscall");
-    unsafe {
-        libc::reboot(reboot_flag);
+    let rc = unsafe { libc::reboot(reboot_flag) };
+    // reboot(2) never returns on success. Any return is an error worth
+    // reporting loudly: the operator asked the machine to go down and it
+    // cannot, so exit non-zero rather than silently succeeding.
+    if rc != 0 {
+        eprintln!(
+            "vigil: reboot(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
     }
-
-    std::process::exit(0);
+    std::process::exit(1);
 }

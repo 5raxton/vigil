@@ -409,10 +409,8 @@ mod tests {
         use std::os::unix::io::RawFd;
         use std::time::Instant;
 
-        let path = std::env::temp_dir().join(format!(
-            "vigil-sock-test-full-{}.sock",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("vigil-sock-test-full-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
         // A raw listener with an explicit tiny backlog (std's UnixListener
@@ -424,7 +422,11 @@ mod tests {
             assert!(fd >= 0, "socket() failed");
             let (addr, slen) = unix_sockaddr(&path).unwrap();
             assert_eq!(
-                libc::bind(fd, &addr as *const libc::sockaddr_un as *const libc::sockaddr, slen),
+                libc::bind(
+                    fd,
+                    &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+                    slen
+                ),
                 0,
                 "bind() failed"
             );
@@ -468,9 +470,7 @@ mod tests {
 
         let start = Instant::now();
         let ok = can_connect(
-            &ListenSpec::Unix {
-                path: path.clone(),
-            },
+            &ListenSpec::Unix { path: path.clone() },
             Duration::from_millis(300),
         );
         let elapsed = start.elapsed();
