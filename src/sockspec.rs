@@ -262,7 +262,10 @@ mod tests {
         assert!(fd >= 0);
         assert!(can_connect(&spec, Duration::from_millis(100)));
 
-        let _ = fd;
+        // bind() took ownership of the descriptor via into_raw_fd(); close it.
+        unsafe {
+            libc::close(fd);
+        }
         let _ = std::fs::remove_file(&path);
     }
 }
