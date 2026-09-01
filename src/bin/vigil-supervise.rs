@@ -1019,10 +1019,10 @@ fn spawn_logger(
         }
         Err(e) => {
             eprintln!(
-                "vigil-supervise [{}]: failed to spawn vigillog: {}",
+                "vigil-supervise [{}]: failed to fork vigillog: {}",
                 service_name, e
             );
-            exit(1);
+            Err(anyhow::anyhow!("failed to fork vigillog: {}", e))
         }
     }
 }

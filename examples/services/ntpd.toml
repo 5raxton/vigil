@@ -8,6 +8,7 @@ working_dir = "/"
 
 [service.readiness]
 type = "pid"
+check = "/run/chronyd.pid"
 
 [service.restart]
 policy = "always"
