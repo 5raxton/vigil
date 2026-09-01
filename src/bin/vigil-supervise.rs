@@ -50,6 +50,17 @@ fn main() -> Result<()> {
 
     block_stop_signals(&config)?;
 
+    // Validate the configured shutdown/kill signal names so a typo surfaces
+    // loudly at startup instead of silently degrading teardown (e.g. a
+    // mistyped `kill_signal = "KILLL"` falling back to SIGTERM and potentially
+    // never force-killing a stuck process).
+    validate_signal_name(&config.service.shutdown.signal, "shutdown.signal", service_name)?;
+    validate_signal_name(
+        &config.service.shutdown.kill_signal,
+        "shutdown.kill_signal",
+        service_name,
+    )?;
+
     let mut restart_count: u32 = 0;
     let mut current_backoff = config.service.restart.backoff_initial_ms;
     let mut last_restart = Instant::now();
@@ -329,10 +340,18 @@ fn supervise_child(
 
     let deadline = Instant::now() + readiness_timeout(readiness);
     let mut ready = readiness.kind == ReadinessType::None;
+    // Whether the "running" state + real service PID has been recorded. For
+    // `none` readiness the service is considered ready immediately after fork;
+    // for other kinds it becomes ready when the probe or readiness signal
+    // fires. It must be written exactly once so `vigil-ctl status` reports the
+    // real PID for every running service, including those with no readiness
+    // check.
+    let mut ready_recorded = false;
     let mut probe = if ready {
         None
     } else {
-        Some(ReadinessProbe::new(readiness, service_name))
+        let socket_target = socket_readiness_target(config);
+        Some(ReadinessProbe::new(readiness, service_name, socket_target))
     };
 
     let child_pid_raw = child_pid.as_raw();
@@ -408,11 +427,19 @@ fn supervise_child(
             }
             Some(sig) if ready_sig == Some(sig) => {
                 ready = true;
-                let _ = writeln_state(status_dir, "running", Some(child_pid_raw as u32));
             }
             Some(libc::SIGCHLD) => {}
             Some(_) => {}
             None => {}
+        }
+
+        // Record the service as running (with its real PID) exactly once, as
+        // soon as it is ready. This covers the `none` readiness kind, which
+        // otherwise never wrote the state/pid, and any kind that just became
+        // ready above.
+        if ready && !ready_recorded {
+            let _ = writeln_state(status_dir, "running", Some(child_pid_raw as u32));
+            ready_recorded = true;
         }
 
         if !ready {
@@ -439,7 +466,6 @@ fn supervise_child(
                 match probe.tick() {
                     ProbeResult::Ready => {
                         ready = true;
-                        let _ = writeln_state(status_dir, "running", Some(child_pid_raw as u32));
                         probe.cleanup();
                     }
                     ProbeResult::Failed(msg) => {
@@ -477,6 +503,15 @@ enum ProbeResult {
     Failed(String),
 }
 
+/// The parsed first `[socket]` listen endpoint, used as the connect target
+/// for `readiness.type = "socket"` when no explicit `check` spec is given.
+fn socket_readiness_target(config: &ServiceConfig) -> Option<ListenSpec> {
+    let sock = config.socket.as_ref()?;
+    let first = sock.listen.first()?;
+    let proto = sock.proto();
+    sockspec::parse_listen_spec(first, proto).ok()
+}
+
 /// Drives a configured readiness check. Only one probe type is active per
 /// service (from `[service.readiness]`), driven from the supervision loop.
 struct ReadinessProbe {
@@ -491,11 +526,19 @@ struct ReadinessProbe {
 }
 
 impl ReadinessProbe {
-    fn new(readiness: &vigil::config::ReadinessConfig, service_name: &str) -> Self {
+    /// `socket_target` is the parsed first `[socket]` listen endpoint, used
+    /// when `readiness.type = "socket"` and no explicit `check` connect spec
+    /// is given (matching the documented behaviour of probing the first
+    /// listen endpoint).
+    fn new(
+        readiness: &vigil::config::ReadinessConfig,
+        service_name: &str,
+        socket_target: Option<ListenSpec>,
+    ) -> Self {
         let check = readiness.check.clone();
         let mut probe = ReadinessProbe {
             kind: readiness.kind.clone(),
-            spec: None,
+            spec: socket_target,
             pidfile: None,
             exec_cmd: None,
             exec_child: None,
@@ -524,8 +567,16 @@ impl ReadinessProbe {
                     }
                 },
                 None => {
-                    probe.invalid =
-                        Some("readiness type 'socket' requires check=<connect spec>".to_string());
+                    // No explicit connect target: fall back to the first
+                    // `[socket]` listen endpoint if one is configured. This is
+                    // what the sshd example relies on.
+                    if probe.spec.is_none() {
+                        probe.invalid = Some(
+                            "readiness type 'socket' requires check=<connect spec> \
+                             or a [socket] listen entry"
+                                .to_string(),
+                        );
+                    }
                 }
             },
             ReadinessType::Exec => match check {
@@ -556,7 +607,11 @@ impl ReadinessProbe {
         }
 
         match self.kind {
-            ReadinessType::None | ReadinessType::Signal => ProbeResult::Ready,
+            // `Signal` readiness is satisfied only when the child raises the
+            // configured signal (handled directly in the supervision loop),
+            // never by the probe itself.
+            ReadinessType::None => ProbeResult::Ready,
+            ReadinessType::Signal => ProbeResult::Pending,
             ReadinessType::Pid => self.tick_pidfile(),
             ReadinessType::Socket => self.tick_socket(),
             ReadinessType::Exec => self.tick_exec(),
@@ -778,6 +833,26 @@ fn describe_exit(code: Option<i32>, signal: Option<Signal>) -> String {
         (Some(c), None) => format!("exit code {}", c),
         (None, Some(s)) => format!("signal {:?}", s),
         _ => "unknown".to_string(),
+    }
+}
+
+/// Accept only signal names `signal_from_name` maps exactly (the runtime
+/// source of truth), so a name cannot be reported as valid here and then
+/// silently sent as a different signal by `signal_from_name`.
+fn validate_signal_name(name: &str, field: &str, service_name: &str) -> Result<()> {
+    let valid = matches!(
+        name,
+        "TERM" | "KILL" | "STOP" | "HUP" | "INT" | "QUIT" | "USR1" | "USR2" | "ALRM" | "PIPE"
+    );
+    if valid {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "vigil-supervise [{}]: invalid {} '{}' (TERM/INT/QUIT/KILL/HUP/USR1/USR2/ALRM/PIPE/STOP)",
+            service_name,
+            field,
+            name
+        )
     }
 }
 
@@ -1103,7 +1178,9 @@ fn apply_resource_limits(config: &ServiceConfig) -> Result<()> {
         setrlimit(Resource::RLIMIT_NPROC, max_procs, max_procs)?;
     }
     if let Some(max_memory) = config.service.resource_limits.max_memory_mb {
-        let bytes = max_memory * 1024 * 1024;
+        let bytes = max_memory
+            .saturating_mul(1024)
+            .saturating_mul(1024);
         setrlimit(Resource::RLIMIT_AS, bytes, bytes)?;
     }
     Ok(())
@@ -1355,5 +1432,75 @@ mod tests {
             readiness_timeout(&rc),
             Duration::from_millis(DEFAULT_READINESS_TIMEOUT)
         );
+    }
+
+    fn parse_service(toml: &str) -> ServiceConfig {
+        toml::from_str(toml).unwrap()
+    }
+
+    #[test]
+    fn signal_readiness_is_not_ready_from_probe() {
+        // A `signal`-type readiness must only become ready when the child
+        // actually raises the signal — the probe itself must never declare it
+        // ready.
+        let cfg = parse_service(
+            r#"
+            [service]
+            command = "/bin/true"
+            [service.readiness]
+            type = "signal"
+            signal = "USR1"
+            "#,
+        );
+        let rc = &cfg.service.readiness;
+        let mut probe =
+            ReadinessProbe::new(rc, "test", socket_readiness_target(&cfg));
+        assert!(
+            matches!(probe.tick(), ProbeResult::Pending),
+            "signal readiness must wait for the signal, not the probe"
+        );
+    }
+
+    #[test]
+    fn socket_readiness_falls_back_to_first_listen_spec() {
+        // sshd-style: `[socket] listen = ["tcp:22"]` with `readiness.type =
+        // "socket"` and no explicit `check` should resolve to the listen
+        // endpoint instead of being rejected.
+        let cfg = parse_service(
+            r#"
+            [service]
+            command = "/bin/true"
+            [service.readiness]
+            type = "socket"
+            [socket]
+            listen = ["tcp:22"]
+            "#,
+        );
+        let rc = &cfg.service.readiness;
+        let mut probe =
+            ReadinessProbe::new(rc, "test", socket_readiness_target(&cfg));
+        assert!(probe.invalid.is_none(), "probe should not be invalid");
+        assert!(matches!(probe.kind, ReadinessType::Socket));
+        assert!(probe.spec.is_some(), "socket probe should carry a target");
+        // The socket is not yet listening, so it must report pending (not a
+        // false failure).
+        assert!(matches!(probe.tick(), ProbeResult::Pending));
+    }
+
+    #[test]
+    fn socket_readiness_without_target_is_failed() {
+        let cfg = parse_service(
+            r#"
+            [service]
+            command = "/bin/true"
+            [service.readiness]
+            type = "socket"
+            "#,
+        );
+        let rc = &cfg.service.readiness;
+        let mut probe =
+            ReadinessProbe::new(rc, "test", socket_readiness_target(&cfg));
+        assert!(probe.invalid.is_some());
+        assert!(matches!(probe.tick(), ProbeResult::Failed(_)));
     }
 }
