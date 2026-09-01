@@ -7,7 +7,9 @@ use std::path::PathBuf;
 /// that a set of freshly built binaries works without installation (e.g.
 /// testing directly out of `target/release/`). Afterwards a fixed system
 /// search path is used, including `/usr/sbin`, `/sbin` and `/usr/local/bin`
-/// for admin-installed deployments.
+/// for admin-installed deployments. Duplicates are removed while preserving
+/// the search order (e.g. when the running binary already lives in one of the
+/// system directories).
 pub fn exec_search_paths(binary: &str) -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
@@ -20,6 +22,9 @@ pub fn exec_search_paths(binary: &str) -> Vec<PathBuf> {
     for base in ["/usr/local/bin", "/usr/sbin", "/sbin", "/usr/bin", "/bin"] {
         paths.push(PathBuf::from(base).join(binary));
     }
+
+    let mut seen = std::collections::HashSet::new();
+    paths.retain(|p| seen.insert(p.clone()));
 
     paths
 }

@@ -1120,3 +1120,22 @@ fn is_valid_service_name(name: &str) -> bool {
     name.bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
 }
+
+#[cfg(test)]
+mod tests {
+    use super::is_valid_service_name;
+
+    #[test]
+    fn valid_names_accepted() {
+        for n in ["sshd", "foo-bar_baz", "network.eth0", "a1"] {
+            assert!(is_valid_service_name(n), "{} should be valid", n);
+        }
+    }
+
+    #[test]
+    fn invalid_names_rejected() {
+        for n in ["", ".", "..", "a/b", "../etc", "a b", "a\tb", "a\nb", "a:b"] {
+            assert!(!is_valid_service_name(n), "{} should be rejected", n);
+        }
+    }
+}
