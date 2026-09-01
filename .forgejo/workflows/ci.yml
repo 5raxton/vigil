@@ -4,9 +4,11 @@ name: CI
 # The `-D warnings` clippy pass keeps the tree warning-free and the release
 # build verifies the LTO / panic=abort profile.
 #
-# Uses the standard rust-toolchain / rust-cache actions (which Forgejo's
-# act_runner resolves natively), rather than hand-rolling a rustup install in
-# a shell, because act resets PATH between steps.
+# The self-hosted act_runner resolves actions from the data.forgejo.org mirror,
+# which only hosts first-party `actions/*` repos, so third-party marketplace
+# actions (dtolnay/rust-toolchain, Swatinem/rust-cache) are unavailable here.
+# We therefore use only `actions/checkout` plus shell, and explicitly add the
+# rustup bin dir to $PATH on every step (act resets PATH between steps).
 
 on:
   push:
@@ -23,25 +25,30 @@ jobs:
       - name: Check out the repo
         uses: actions/checkout@v4
 
-      # Each step runs in a fresh shell with a reset PATH, so hand-rolling a
-      # rustup install across steps is fragile. The standard toolchain action
-      # manages the install, PATH updates, and clippy component reliably.
       - name: Install the Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup component add clippy
+          rustc --version
+          cargo --version
 
       - name: Build (all targets)
-        run: cargo build --all-targets --locked
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo build --all-targets --locked
 
       - name: Run tests
-        run: cargo test --all-targets --locked
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test --all-targets --locked
 
       - name: Lint (warnings are errors)
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo clippy --all-targets --locked -- -D warnings
 
       - name: Build release profile
-        run: cargo build --release --locked
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo build --release --locked
