@@ -26,13 +26,16 @@ jobs:
       # Always install rustup (idempotent): the default runner image ships a
       # Rust toolchain but not rustup itself, so we cannot rely on `cargo`
       # being present plus `rustup` for managing components.
+      #
+      # Each step runs in a fresh shell with a reset PATH, so the cargo dir is
+      # explicitly appended to GITHUB_PATH to persist to every later step.
       - name: Install the Rust toolchain (1.87+)
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-          . "$HOME/.cargo/env"
           rustup component add clippy
           rustc --version
           cargo --version
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Build (all targets)
         run: cargo build --all-targets --locked
