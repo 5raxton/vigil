@@ -222,6 +222,14 @@ impl Scanner {
         let target: TargetConfig =
             toml::from_str(&content).with_context(|| "failed to parse target")?;
 
+        // A fresh resolution of the target starts from a clean slate: clear any
+        // degradation recorded by a previous boot/reload so that a now-healthy
+        // target does not keep a stale degraded marker. Any problem detected
+        // while resolving *this* target (e.g. a missing required service below)
+        // re-arms the flag and is NOT clobbered.
+        self.degraded = false;
+        let _ = fs::remove_file(self.config.runtime_dir.join("degraded"));
+
         let target_services = target.services;
         let mut explicitly_disabled: HashSet<String> = HashSet::new();
 
@@ -344,9 +352,6 @@ impl Scanner {
                 self.required_services.len()
             );
         }
-
-        self.degraded = false;
-        let _ = fs::remove_file(self.config.runtime_dir.join("degraded"));
 
         Ok(())
     }
@@ -494,6 +499,20 @@ impl Scanner {
         })?;
 
         listener.set_nonblocking(true)?;
+
+        // Restrict the control socket to root (mode 0600). Without an explicit
+        // chmod the socket would inherit the process umask (typically 022),
+        // leaving it writable by any local user — who could then start/stop
+        // services or trigger a reboot/poweroff. The default umask can be
+        // changed, so always force the safe mode here.
+        let path = CString::new(self.config.control_socket.as_os_str().as_encoded_bytes())?;
+        if unsafe { libc::chmod(path.as_ptr(), 0o600) } != 0 {
+            anyhow::bail!(
+                "failed to set control socket permissions: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
         self.control_listener = Some(listener);
 
         eprintln!(
@@ -603,11 +622,16 @@ impl Scanner {
                         let was_supervising = self.supervisor_was_live(&name);
                         let mut respawn = false;
                         if let Some(state) = self.services.get_mut(&name) {
-                            let degraded = !(state.enabled
-                                && was_supervising
-                                && state.restart_count < state.config.service.restart.max_restarts)
-                                && state.enabled
-                                && self.required_services.contains(&name);
+                            // A required, enabled service is considered failed
+                            // (degrading the boot) when its supervisor is gone
+                            // AND either the service had already given up on its
+                            // own (status != running) or the supervisor has been
+                            // respawned up to the restart ceiling (crash loop).
+                            let degraded = state.enabled
+                                && self.required_services.contains(&name)
+                                && (!was_supervising
+                                    || state.restart_count
+                                        >= state.config.service.restart.max_restarts);
                             state.supervisor_pid = None;
                             state.state = "stopped".into();
                             if state.enabled
@@ -934,16 +958,14 @@ impl Scanner {
         }
 
         let new_names: HashSet<String> = self.services.keys().cloned().collect();
-        let old_names: HashSet<String> = old_services.keys().cloned().collect();
 
-        for name in &old_names {
+        // Services that were removed from the configuration are torn down.
+        for (name, old_state) in &old_services {
             if !new_names.contains(name) {
-                eprintln!("vigil-scan: service '{}' removed, stopping", name);
-                if let Some(old_state) = old_services.get(name) {
-                    if let Some(pid) = old_state.supervisor_pid {
-                        unsafe {
-                            libc::kill(pid as i32, libc::SIGTERM);
-                        }
+                eprintln!("vigil-scan: service '{}' removed from config, stopping", name);
+                if let Some(pid) = old_state.supervisor_pid {
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGTERM);
                     }
                 }
             }
@@ -952,6 +974,10 @@ impl Scanner {
         let target = self.config.default_target.clone();
         self.apply_target(&target)?;
 
+        // Restore the runtime bookkeeping of every service that was running so
+        // its supervisor is still tracked (needed both to keep it running and
+        // to stop it cleanly below). `enabled` is NOT forced back to true: the
+        // freshly re-applied target is authoritative.
         for (name, state) in self.services.iter_mut() {
             if let Some(old_state) = old_services.get(name) {
                 if old_state.state == "running" {
@@ -959,17 +985,31 @@ impl Scanner {
                     state.supervisor_pid = old_state.supervisor_pid;
                     state.restart_count = old_state.restart_count;
                     state.start_time = old_state.start_time;
-                    state.enabled = true;
                 }
             }
         }
 
+        // Stop services that were running but are no longer enabled by the
+        // (possibly changed) target — without this, disabling a service in the
+        // target and reloading would leave it running forever.
+        let to_stop: Vec<String> = self
+            .services
+            .iter()
+            .filter(|(_, s)| s.state == "running" && !s.enabled)
+            .map(|(n, _)| n.clone())
+            .collect();
+        for name in to_stop {
+            eprintln!("vigil-scan: service '{}' disabled on reload, stopping", name);
+            if let Err(e) = self.stop_service(&name) {
+                eprintln!("vigil-scan: failed to stop '{}' on reload: {}", name, e);
+            }
+        }
+
+        // Start newly added services that should be enabled.
         let new_enabled: Vec<String> = self
             .services
             .iter()
-            .filter(|(n, s)| {
-                s.enabled && s.state == "stopped" && !old_services.contains_key(n.as_str())
-            })
+            .filter(|(n, s)| s.enabled && !old_services.contains_key(n.as_str()))
             .map(|(n, _)| n.clone())
             .collect();
         for name in new_enabled {
