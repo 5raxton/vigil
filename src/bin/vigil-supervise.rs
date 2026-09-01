@@ -823,6 +823,14 @@ fn terminate_tree(
 
     let start = Instant::now();
     loop {
+        // The group leader is our direct child (`setpgid(0,0)` in
+        // `run_service_child`). If it has already exited in response to the
+        // signal, waitpid reaps it so it stops being a zombie — `kill(pid, 0)`
+        // reports zombies as alive, and without a reap every promptly-exiting
+        // service would burn the full grace period and then be SIGKILLed for
+        // no reason.
+        let _ = waitpid(Pid::from_raw(pgid), Some(WaitPidFlag::WNOHANG));
+
         if !process_tree_alive(pgid) {
             return;
         }
@@ -834,6 +842,7 @@ fn terminate_tree(
             let _ = nix::sys::signal::kill(Pid::from_raw(-pgid), kill_signal);
             let _ = nix::sys::signal::kill(Pid::from_raw(pgid), kill_signal);
             for _ in 0..40 {
+                let _ = waitpid(Pid::from_raw(pgid), Some(WaitPidFlag::WNOHANG));
                 if !process_tree_alive(pgid) {
                     return;
                 }
