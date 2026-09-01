@@ -4,9 +4,9 @@ name: CI
 # The `-D warnings` clippy pass keeps the tree warning-free and the release
 # build verifies the LTO / panic=abort profile.
 #
-# Deliberately uses only `actions/checkout` (which Forgejo's act_runner resolves
-# natively) plus plain shell, so the build does not depend on third-party
-# marketplace actions being fetchable on a self-hosted instance.
+# Uses the standard rust-toolchain / rust-cache actions (which Forgejo's
+# act_runner resolves natively), rather than hand-rolling a rustup install in
+# a shell, because act resets PATH between steps.
 
 on:
   push:
@@ -23,19 +23,16 @@ jobs:
       - name: Check out the repo
         uses: actions/checkout@v4
 
-      # Always install rustup (idempotent): the default runner image ships a
-      # Rust toolchain but not rustup itself, so we cannot rely on `cargo`
-      # being present plus `rustup` for managing components.
-      #
-      # Each step runs in a fresh shell with a reset PATH, so the cargo dir is
-      # explicitly appended to GITHUB_PATH to persist to every later step.
-      - name: Install the Rust toolchain (1.87+)
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-          rustup component add clippy
-          rustc --version
-          cargo --version
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      # Each step runs in a fresh shell with a reset PATH, so hand-rolling a
+      # rustup install across steps is fragile. The standard toolchain action
+      # manages the install, PATH updates, and clippy component reliably.
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
 
       - name: Build (all targets)
         run: cargo build --all-targets --locked
