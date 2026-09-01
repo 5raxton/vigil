@@ -18,9 +18,6 @@ use vigil::{
     VIGIL_LOG_DIR, VIGIL_SUPERVISE_DIR,
 };
 
-/// Default readiness timeout when `[service.readiness] timeout_ms` is unset.
-const DEFAULT_READINESS_TIMEOUT: u64 = 30_000;
-
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
@@ -356,7 +353,7 @@ fn supervise_child(
         }
     }
 
-    let deadline = Instant::now() + readiness_timeout(readiness);
+    let deadline = Instant::now() + readiness.timeout();
     let mut ready = readiness.kind == ReadinessType::None;
     // Whether the "running" state + real service PID has been recorded. For
     // `none` readiness the service is considered ready immediately after fork;
@@ -509,10 +506,6 @@ fn supervise_child(
 
         std::thread::sleep(Duration::from_millis(50));
     }
-}
-
-fn readiness_timeout(readiness: &vigil::config::ReadinessConfig) -> Duration {
-    Duration::from_millis(readiness.timeout_ms.unwrap_or(DEFAULT_READINESS_TIMEOUT))
 }
 
 enum ProbeResult {
@@ -1337,9 +1330,17 @@ fn drop_privileges(config: &ServiceConfig) -> Result<()> {
         if user_name != "root" {
             if libc::initgroups(c_user.as_ptr(), gid) != 0 {
                 // Fall back to the primary group only if /etc/group cannot
-                // be read.
+                // be read. A failed fallback must abort the drop rather than
+                // quietly running with the parent's supplementary groups
+                // (which, under a root supervisor, could include admin groups).
                 let groups = [gid];
-                libc::setgroups(1, groups.as_ptr());
+                if libc::setgroups(1, groups.as_ptr()) != 0 {
+                    return Err(anyhow::anyhow!(
+                        "setgroups({}) failed: {}",
+                        gid,
+                        std::io::Error::last_os_error()
+                    ));
+                }
             }
             if libc::setgid(gid) != 0 {
                 return Err(anyhow::anyhow!(
@@ -1542,10 +1543,7 @@ mod tests {
     #[test]
     fn readiness_timeout_default() {
         let rc = vigil::config::ReadinessConfig::default();
-        assert_eq!(
-            readiness_timeout(&rc),
-            Duration::from_millis(DEFAULT_READINESS_TIMEOUT)
-        );
+        assert_eq!(rc.timeout(), Duration::from_millis(30_000));
     }
 
     fn parse_service(toml: &str) -> ServiceConfig {

@@ -925,6 +925,14 @@ impl Scanner {
                     };
                 }
 
+                // A deliberate start from the control plane resets the crash
+                // budget: an operator asking for a fresh start must not inherit
+                // a stale restart counter that could instantly deny further
+                // respawns.
+                if let Some(state) = self.services.get_mut(&service) {
+                    state.restart_count = 0;
+                }
+
                 match self.start_service(&service) {
                     Ok(()) => Response::Ok {
                         message: format!("service '{}' started", service),
@@ -957,6 +965,12 @@ impl Scanner {
                     return Response::Error {
                         message: format!("service '{}' not found", service),
                     };
+                }
+
+                // Deliberate restart: reset the crash budget so a clean manual
+                // restart is not refused moments later by a stale counter.
+                if let Some(state) = self.services.get_mut(&service) {
+                    state.restart_count = 0;
                 }
 
                 match self.stop_service(&service) {

@@ -32,7 +32,12 @@ fn setup_console() {
             libc::dup2(fd, 0);
             libc::dup2(fd, 1);
             libc::dup2(fd, 2);
-            libc::close(fd);
+            // If open() returned an fd that collided with 0/1/2 (they were
+            // already closed), dup2 is a no-op for that slot and closing fd
+            // would wrongly close the very stream we just wired up.
+            if fd > 2 {
+                libc::close(fd);
+            }
         }
     } else {
         let dev_null = CString::new("/dev/null").unwrap();
@@ -42,7 +47,9 @@ fn setup_console() {
                 libc::dup2(fd, 0);
                 libc::dup2(fd, 1);
                 libc::dup2(fd, 2);
-                libc::close(fd);
+                if fd > 2 {
+                    libc::close(fd);
+                }
             }
         }
     }
@@ -385,9 +392,24 @@ fn exec_shutdown(action: &str) -> ! {
         }
     }
 
-    for cmd in &["/sbin/reboot", "/usr/sbin/reboot"] {
-        if let Ok(c_path) = CString::new(*cmd) {
-            if execvp(&c_path, std::slice::from_ref(&c_path)).is_ok() {
+    // Direct action binaries. A plain bare `/sbin/reboot` would always reboot,
+    // silently turning a halt/poweroff request into a reboot, so try the
+    // action-specific binary first and pass the util-linux flag to reboot(8)
+    // where the two are the same program.
+    let direct_bin = match action {
+        "halt" => "halt",
+        "poweroff" => "poweroff",
+        _ => "reboot",
+    };
+    for cmd in &["/sbin", "/usr/sbin"] {
+        if let Ok(c_path) = CString::new(format!("{}/{}", cmd, direct_bin)) {
+            let argv: Vec<CString> = if direct_bin == "reboot" && action != "reboot" {
+                let c_flag = CString::new(if action == "halt" { "-h" } else { "-p" }).unwrap();
+                vec![c_path.clone(), c_flag]
+            } else {
+                vec![c_path.clone()]
+            };
+            if execvp(&c_path, &argv).is_ok() {
                 unreachable!();
             }
         }
