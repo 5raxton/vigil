@@ -345,6 +345,18 @@ fn get_children_of(ppid: i32) -> Vec<i32> {
 fn exec_shutdown(action: &str) -> ! {
     use nix::unistd::execvp;
 
+    // The init loop runs with a blocked signal set (SIGCHLD/SIGTERM/…).
+    // `execvp` preserves that mask in the new image, which would leave
+    // `/sbin/shutdown` unable to catch the very signals it needs (e.g.
+    // SIGTERM on timeout, SIGCHLD to reap children). Reset to the default
+    // empty mask before chain-loading so the shutdown program behaves
+    // normally.
+    let mut empty: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut empty);
+        libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
+    }
+
     let reboot_flag = match action {
         "halt" => libc::RB_HALT_SYSTEM,
         "poweroff" => libc::RB_POWER_OFF,

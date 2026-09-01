@@ -131,7 +131,7 @@ fn main() -> Result<()> {
         }
 
         let vigillog_pid = if log_read >= 0 {
-            match spawn_logger(&config, default_log_dir, service_name, log_read) {
+            match spawn_logger(&config, default_log_dir, service_name, log_read, &listen_fds) {
                 Ok(pid) => Some(pid),
                 Err(e) => {
                     eprintln!(
@@ -800,11 +800,18 @@ fn terminate_tree(
     grace: Duration,
     service_name: &str,
 ) {
+    // Signal both the whole tree and the leader directly. The leader sets its
+    // own process group (`setpgid(0,0)`) very early in `run_service_child`,
+    // but there is a brief window between fork and that call during which
+    // `kill(-pgid)` returns ESRCH and the tree would be considered gone even
+    // though the (not-yet-group-leader) child is alive. Signaling the leader
+    // itself closes that race so an early stop can never orphan the child.
     let _ = nix::sys::signal::kill(Pid::from_raw(-pgid), signal);
+    let _ = nix::sys::signal::kill(Pid::from_raw(pgid), signal);
 
     let start = Instant::now();
     loop {
-        if !process_group_alive(pgid) {
+        if !process_tree_alive(pgid) {
             return;
         }
         if start.elapsed() >= grace {
@@ -813,8 +820,9 @@ fn terminate_tree(
                 service_name, pgid
             );
             let _ = nix::sys::signal::kill(Pid::from_raw(-pgid), kill_signal);
+            let _ = nix::sys::signal::kill(Pid::from_raw(pgid), kill_signal);
             for _ in 0..40 {
-                if !process_group_alive(pgid) {
+                if !process_tree_alive(pgid) {
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -825,8 +833,24 @@ fn terminate_tree(
     }
 }
 
-fn process_group_alive(pgid: i32) -> bool {
+/// True when either the group leader itself is alive or there are still live
+/// members in its process group. Checking the leader PID directly covers the
+/// not-yet-process-group-leader window where `kill(-pgid)` would return ESRCH
+/// even though the child is running.
+fn process_tree_alive(pgid: i32) -> bool {
+    if process_alive(pgid) {
+        return true;
+    }
     match nix::sys::signal::kill(Pid::from_raw(-pgid), None) {
+        Ok(()) => true,
+        Err(nix::errno::Errno::ESRCH) => false,
+        Err(nix::errno::Errno::EPERM) => true,
+        Err(_) => false,
+    }
+}
+
+fn process_alive(pid: i32) -> bool {
+    match nix::sys::signal::kill(Pid::from_raw(pid), None) {
         Ok(()) => true,
         Err(nix::errno::Errno::ESRCH) => false,
         Err(nix::errno::Errno::EPERM) => true,
@@ -962,6 +986,7 @@ fn spawn_logger(
     default_log_dir: &str,
     service_name: &str,
     log_read: i32,
+    listen_fds: &[i32],
 ) -> Result<Pid> {
     let raw_args: Vec<String> = match config.logging.kind {
         LogType::Pipe => {
@@ -1014,6 +1039,18 @@ fn spawn_logger(
                 unsafe {
                     libc::dup2(log_read, 0);
                     libc::close(log_read);
+                }
+            }
+
+            // The logger only needs stdin; drop the inherited copies of the
+            // listening descriptors so a wedged logger cannot hold the bound
+            // sockets open across a service restart (which would otherwise
+            // make rebinding fail with EADDRINUSE).
+            for &fd in listen_fds {
+                if fd > 2 {
+                    unsafe {
+                        libc::close(fd);
+                    }
                 }
             }
 
