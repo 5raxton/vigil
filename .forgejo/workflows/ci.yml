@@ -1,0 +1,46 @@
+name: CI
+
+# Builds, tests, and lints every Vigil binary on each push and pull request.
+# The `-D warnings` clippy pass keeps the tree warning-free and the release
+# build verifies the LTO / panic=abort profile.
+#
+# Deliberately uses only `actions/checkout` (which Forgejo's act_runner resolves
+# natively) plus plain shell, so the build does not depend on third-party
+# marketplace actions being fetchable on a self-hosted instance.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain (1.87+)
+        run: |
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+          rustup component add clippy
+          rustc --version
+          cargo --version
+
+      - name: Build (all targets)
+        run: cargo build --all-targets --locked
+
+      - name: Run tests
+        run: cargo test --all-targets --locked
+
+      - name: Lint (warnings are errors)
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Build release profile
+        run: cargo build --release --locked
