@@ -70,7 +70,7 @@ Vigil is built around four guiding principles:
 - **Supervisor resilience** — a crashed supervisor is detected and respawned (a "second chance"), so one bad supervisor can never take down unrelated services; PID 1 likewise restarts the scanner if it ever dies. Services are started under `PR_SET_PDEATHSIG(SIGKILL)`, so a supervisor that dies mid-run takes its service with it and a respawned supervisor starts a fresh instance — no orphaned duplicates.
 - **Resource limits** — max open files, processes, address space, and cgroup CPU shares per service, applied with `setrlimit` before dropping privileges.
 - **Privilege drop** — services run as the configured `user`/`group` (primary group fallback, supplementary groups re-initialized via `initgroups`).
-- **Per-service logging** — three real modes: `pipe` (live pipeline into size/count-rotated files), `file` (supervisor opens/rotates the file directly), and `syslog` (RFC 3164 messages to `/dev/log`), plus `none`. Never lossy; never stops the service.
+- **Per-service logging** — three real modes: `pipe` (live pipeline into size/count-rotated files), `file` (vigillog appends directly and rotates the configured file), and `syslog` (RFC 3164 messages to `/dev/log`), plus `none`. Never lossy; never stops the service.
 - **Unix-socket control plane** — a simple, documented JSON-over-socket protocol (no D-Bus).
 - **Config reload** — `SIGHUP` or `vigil-ctl reload` reloads service definitions and re-applies the boot target.
 - **Graceful teardown** — reverse-dependency order; `stop`/`restart` SIGTERM the supervisor, which in turn terminates the service and its entire process group, then waits through the configured TERM→KILL grace.

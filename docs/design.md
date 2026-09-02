@@ -57,8 +57,9 @@ pipeline the next without a shared config lookup.
    backoff before restarting, subject to `max_restarts`;
 6. in parallel reaps its own children and answers signals.
 
-The control loop and the child waiter both poll at 50 ms — fast enough for
-realtime-feeling restarts while remaining a constant, allocation-free hot path.
+The control loop polls at 100 ms and the supervisor's child waiter at 50 ms —
+fast enough for realtime-feeling restarts while remaining a constant,
+allocation-free hot path.
 
 ## Readiness checks
 
