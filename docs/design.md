@@ -36,7 +36,7 @@ searching `$ORIGIN` of the current executable, then `/usr/local/bin`,
 `/usr/sbin`, `/sbin`, `/usr/bin`, `/bin`. Installation into `/usr/sbin` works
 from any of those roots. No PATH dependency at boot.
 
-`vigil-scan` is launched by PID 1; supervisors are launched by vigilant-scan;
+`vigil-scan` is launched by PID 1; supervisors are launched by vigil-scan;
 `vigillog` is launched by `vigil-supervise` inside a fork, so each layer can
 pipeline the next without a shared config lookup.
 

@@ -37,6 +37,7 @@ struct ServiceState {
     start_time: Option<Instant>,
     enabled: bool,
     last_respawn: Option<Instant>,
+    stopped_by_operator: bool,
 }
 
 struct Scanner {
@@ -196,6 +197,7 @@ impl Scanner {
                                     start_time: None,
                                     enabled: true,
                                     last_respawn: None,
+                                    stopped_by_operator: false,
                                 },
                             );
                         }
@@ -468,6 +470,7 @@ impl Scanner {
                 state.state = "running".into();
                 state.supervisor_pid = Some(child.as_raw() as u32);
                 state.start_time = Some(Instant::now());
+                state.stopped_by_operator = false;
                 Ok(())
             }
             Ok(ForkResult::Child) => {
@@ -527,6 +530,7 @@ impl Scanner {
             state.state = "stopped".into();
             state.supervisor_pid = None;
             state.start_time = None;
+            state.stopped_by_operator = true;
 
             let status_dir = self
                 .config
@@ -696,9 +700,11 @@ impl Scanner {
                             // (degrading the boot) when its supervisor is gone
                             // AND either the service had already given up on its
                             // own (status != running) or the supervisor has been
-                            // respawned up to the restart ceiling (crash loop).
+                            // respawned up to the restart ceiling (crash loop). A
+                            // deliberate operator stop never degrades the boot.
                             let degraded = state.enabled
                                 && self.required_services.contains(&name)
+                                && !state.stopped_by_operator
                                 && (!was_supervising
                                     || state.restart_count
                                         >= state.config.service.restart.max_restarts);
@@ -706,6 +712,7 @@ impl Scanner {
                             state.state = "stopped".into();
                             if state.enabled
                                 && was_supervising
+                                && !state.stopped_by_operator
                                 && state.restart_count < state.config.service.restart.max_restarts
                             {
                                 // The crash counter decays: a supervisor that

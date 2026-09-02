@@ -12,7 +12,9 @@ Every message is:
 4-byte little-endian payload length  |  JSON payload
 ```
 
-- Reads enforce a 1 MiB maximum payload.
+- Reads enforce a 16 MiB maximum payload (`protocol::read_message` rejects
+  frames longer than that; `vigil-ctl log -n` is additionally capped at 10,000
+  lines).
 - Requests and Responses are serialized `enum`s; an unknown variant is a
   protocol error and the connection is closed.
 - On success the scanner accepts the connection; there is no auth beyond Unix
