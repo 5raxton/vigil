@@ -311,11 +311,7 @@ fn block_stop_signals(config: &ServiceConfig) -> Result<()> {
     if config.service.readiness.kind == ReadinessType::Signal {
         let sig = signal_signo(config.service.readiness.ready_signal())
             .context("invalid readiness signal name")?;
-        if matches!(sig, libc::SIGTERM | libc::SIGINT | libc::SIGHUP) {
-            anyhow::bail!(
-                "readiness signal must not be one of TERM/INT/HUP (reserved for stopping)"
-            );
-        }
+        validate_ready_signal(sig)?;
         unsafe {
             libc::sigaddset(&mut sigset, sig);
         }
@@ -323,6 +319,28 @@ fn block_stop_signals(config: &ServiceConfig) -> Result<()> {
 
     unsafe {
         libc::sigprocmask(libc::SIG_BLOCK, &sigset, std::ptr::null_mut());
+    }
+    Ok(())
+}
+
+/// Reject readiness signals that would never work as a liveness report.
+fn validate_ready_signal(sig: libc::c_int) -> Result<()> {
+    // TERM/INT/HUP are reserved for the stop path.
+    if matches!(sig, libc::SIGTERM | libc::SIGINT | libc::SIGHUP) {
+        anyhow::bail!(
+            "readiness signal must not be one of TERM/INT/HUP (reserved for stopping)"
+        );
+    }
+    // SIGCHLD is reserved for reaping the service, and SIGKILL/SIGSTOP
+    // cannot be caught, blocked, or delivered as a readiness report (the
+    // kernel ignores attempts to block/raise them). Rejecting them up
+    // front prevents a config that could never become ready (an eternal
+    // restart loop) or one that spuriously reports ready the moment the
+    // first child exits.
+    if matches!(sig, libc::SIGCHLD | libc::SIGKILL | libc::SIGSTOP) {
+        anyhow::bail!(
+            "readiness signal must not be CHLD, KILL or STOP (reserved or unblockable)"
+        );
     }
     Ok(())
 }
@@ -1553,6 +1571,33 @@ mod tests {
         assert_eq!(signal_signo("term"), None); // must match exact names
         assert_eq!(signal_signo("bogus"), None);
         assert!(signal_signo("KILL").is_some());
+    }
+
+    #[test]
+    fn ready_signal_reserved_names_rejected() {
+        // Stop-path and reaper signals must be rejected as readiness signals.
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGCHLD] {
+            assert!(
+                validate_ready_signal(sig).is_err(),
+                "{} must be rejected",
+                sig
+            );
+        }
+        // Unblockable signals must be rejected too.
+        for sig in [libc::SIGKILL, libc::SIGSTOP] {
+            assert!(validate_ready_signal(sig).is_err(), "{} must be rejected", sig);
+        }
+    }
+
+    #[test]
+    fn ready_signal_usable_names_accepted() {
+        for sig in [libc::SIGUSR1, libc::SIGUSR2, libc::SIGPIPE, libc::SIGALRM] {
+            assert!(
+                validate_ready_signal(sig).is_ok(),
+                "{} must be accepted",
+                sig
+            );
+        }
     }
 
     #[test]
