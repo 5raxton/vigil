@@ -7,6 +7,7 @@ use std::env;
 use std::ffi::CString;
 use std::fs;
 use std::io::Write;
+use std::os::unix::process::CommandExt as NixCommandExt;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::time::{Duration, Instant};
@@ -722,13 +723,21 @@ impl ReadinessProbe {
                     return ProbeResult::Failed("exec check configured without a command".into())
                 }
             };
-            match std::process::Command::new(&cmd[0])
+            let mut probe_cmd = std::process::Command::new(&cmd[0]);
+            probe_cmd
                 .args(&cmd[1..])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-            {
+                .stderr(std::process::Stdio::null());
+            // The supervisor blocks SIGCHLD/SIGTERM/SIGINT/SIGHUP (and the
+            // readiness signal); run probes with an empty signal mask.
+            unsafe {
+                probe_cmd.pre_exec(|| {
+                    reset_signal_mask();
+                    Ok(())
+                });
+            }
+            match probe_cmd.spawn() {
                 Ok(c) => {
                     self.exec_start = Some(Instant::now());
                     self.exec_child = Some(c);
@@ -1535,16 +1544,25 @@ fn run_finish_script(service_name: &str, config_path: &Path, log_dir: &Path, res
             service_name,
             finish_path.display()
         );
-        let _ = std::process::Command::new(&finish_path)
-            .arg(service_name)
+        let mut cmd = std::process::Command::new(&finish_path);
+        cmd.arg(service_name)
             .env("SERVICE_NAME", service_name)
             .env("CONFIG_PATH", config_path)
             .env("LOG_DIR", log_dir)
             .env("RESTART_COUNT", restart_count.to_string())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+            .stderr(std::process::Stdio::null());
+        // The supervisor runs with SIGCHLD/SIGTERM/SIGINT/SIGHUP (and
+        // possibly the readiness signal) blocked; spawn children with an
+        // empty mask so traps and signal-driven cleanup actually fire.
+        unsafe {
+            cmd.pre_exec(|| {
+                reset_signal_mask();
+                Ok(())
+            });
+        }
+        let _ = cmd.status();
     }
 }
 
@@ -1678,5 +1696,87 @@ mod tests {
         let mut probe = ReadinessProbe::new(rc, "test", socket_readiness_target(&cfg));
         assert!(probe.invalid.is_some());
         assert!(matches!(probe.tick(), ProbeResult::Failed(_)));
+    }
+
+    #[test]
+    fn spawned_children_get_a_clean_signal_mask() {
+        // Regression test: the supervisor blocks SIGCHLD/SIGTERM/SIGINT/SIGHUP
+        // and must hand its children (finish script, readiness exec probe) an
+        // empty mask so their traps/signal handlers actually fire. Previously
+        // the blocked mask leaked into these children.
+        use std::os::unix::process::CommandExt as _;
+
+        let mut sigset: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut sigset);
+            libc::sigaddset(&mut sigset, libc::SIGCHLD);
+            libc::sigaddset(&mut sigset, libc::SIGTERM);
+            libc::sigaddset(&mut sigset, libc::SIGINT);
+            libc::sigaddset(&mut sigset, libc::SIGHUP);
+            libc::sigprocmask(libc::SIG_BLOCK, &sigset, std::ptr::null_mut());
+        }
+
+        // A child spawned with the reset (the pattern used by the finish
+        // script and readiness probes) must see an empty blocked set.
+        let mut clean = std::process::Command::new("/bin/sh");
+        clean.arg("-c")
+            .arg("grep '^SigBlk' /proc/self/status")
+            .stdout(std::process::Stdio::piped());
+        unsafe {
+            clean.pre_exec(|| {
+                reset_signal_mask();
+                Ok(())
+            });
+        }
+        let out = clean.output().unwrap();
+        let text = String::from_utf8(out.stdout).unwrap();
+        let block_line = text
+            .lines()
+            .find(|l| l.starts_with("SigBlk"))
+            .expect("child must report its blocked-signal mask")
+            .to_string();
+        reset_signal_mask();
+
+        // SigBlk bitmask is all-zero when no signal is blocked.
+        assert!(
+            block_line.ends_with("0000000000000000"),
+            "reset child must inherit an empty signal mask, got: {}",
+            block_line
+        );
+    }
+
+    #[test]
+    fn blocked_signals_are_inherited_without_a_reset() {
+        // Control for `spawned_children_get_a_clean_signal_mask`: without the
+        // pre-exec reset, the SIGCHLD/SIGTERM/SIGINT/SIGHUP blocks set above
+        // must leak into the child. This proves the test distinguishes a real
+        // fix from a false pass.
+        let mut sigset: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut sigset);
+            libc::sigaddset(&mut sigset, libc::SIGCHLD);
+            libc::sigaddset(&mut sigset, libc::SIGTERM);
+            libc::sigaddset(&mut sigset, libc::SIGINT);
+            libc::sigaddset(&mut sigset, libc::SIGHUP);
+            libc::sigprocmask(libc::SIG_BLOCK, &sigset, std::ptr::null_mut());
+        }
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("grep '^SigBlk' /proc/self/status")
+            .stdout(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+        let block_line = String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .find(|l| l.starts_with("SigBlk"))
+            .unwrap()
+            .to_string();
+        reset_signal_mask();
+        assert!(
+            !block_line.ends_with("0000000000000000"),
+            "without a reset the blocked mask must leak into children, got: {}",
+            block_line
+        );
     }
 }
