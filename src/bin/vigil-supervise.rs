@@ -1570,6 +1570,69 @@ fn run_finish_script(service_name: &str, config_path: &Path, log_dir: &Path, res
 mod tests {
     use super::*;
 
+    // Fork and, in the child, report the blocked-signal mask over a pipe after
+    // optionally resetting it. Uses raw fork()/waitpid() rather than
+    // std::process::Command, because std::process clears the child signal mask
+    // during spawn on some libc/glibc versions, which would make the
+    // inheritance controls below unobservable. A plain fork() deterministically
+    // inherits the calling thread's mask.
+    fn child_reports_mask_after_reset(reset: bool) -> String {
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+
+        match unsafe { libc::fork() } {
+            -1 => panic!("fork failed"),
+            0 => {
+                // Child: close the read end, write SigBlk, then _exit without
+                // touching any stdlib/atexit state from the test harness.
+                unsafe { libc::close(fds[0]) };
+                if reset {
+                    reset_signal_mask();
+                }
+                let status =
+                    std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+                let line = status
+                    .lines()
+                    .find(|l| l.starts_with("SigBlk"))
+                    .unwrap_or_default()
+                    .to_string();
+                let bytes = line.as_bytes();
+                // Write a bounded chunk; the mask is short and a single write is
+                // fine for a 4 KiB pipe.
+                unsafe {
+                    libc::write(
+                        fds[1],
+                        bytes.as_ptr() as *const libc::c_void,
+                        bytes.len(),
+                    );
+                }
+                unsafe { libc::_exit(0) }
+            }
+            pid => {
+                // Parent: close the write end, read what the child reported.
+                unsafe { libc::close(fds[1]) };
+                let mut buf = vec![0u8; 256];
+                let n = unsafe {
+                    libc::read(fds[0], buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                };
+                unsafe { libc::close(fds[0]) };
+                let mut status = 0;
+                loop {
+                    let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+                    if r == -1 {
+                        let e = std::io::Error::last_os_error();
+                        if e.raw_os_error() == Some(libc::EINTR) {
+                            continue;
+                        }
+                        panic!("waitpid failed: {}", e);
+                    }
+                    break;
+                }
+                String::from_utf8_lossy(&buf[..n.max(0) as usize]).to_string()
+            }
+        }
+    }
+
     #[test]
     fn shares_to_weight_endpoints() {
         assert_eq!(shares_to_weight(2), 1);
@@ -1699,13 +1762,13 @@ mod tests {
     }
 
     #[test]
-    fn spawned_children_get_a_clean_signal_mask() {
-        // Regression test: the supervisor blocks SIGCHLD/SIGTERM/SIGINT/SIGHUP
-        // and must hand its children (finish script, readiness exec probe) an
-        // empty mask so their traps/signal handlers actually fire. Previously
-        // the blocked mask leaked into these children.
-        use std::os::unix::process::CommandExt as _;
-
+    fn child_signal_mask_reset_and_inheritance() {
+        // The supervisor blocks SIGCHLD/SIGTERM/SIGINT/SIGHUP and must hand its
+        // children (finish script, readiness exec probe) an empty mask so their
+        // traps/signal handlers actually fire. These two controls share the
+        // process-global signal mask, so they must run back-to-back within a
+        // single test: running them as separate parallel tests raced, because
+        // one could unblock the mask while the other was mid-flight.
         let mut sigset: libc::sigset_t = unsafe { std::mem::zeroed() };
         unsafe {
             libc::sigemptyset(&mut sigset);
@@ -1716,67 +1779,29 @@ mod tests {
             libc::sigprocmask(libc::SIG_BLOCK, &sigset, std::ptr::null_mut());
         }
 
-        // A child spawned with the reset (the pattern used by the finish
-        // script and readiness probes) must see an empty blocked set.
-        let mut clean = std::process::Command::new("/bin/sh");
-        clean.arg("-c")
-            .arg("grep '^SigBlk' /proc/self/status")
-            .stdout(std::process::Stdio::piped());
-        unsafe {
-            clean.pre_exec(|| {
-                reset_signal_mask();
-                Ok(())
-            });
-        }
-        let out = clean.output().unwrap();
-        let text = String::from_utf8(out.stdout).unwrap();
-        let block_line = text
-            .lines()
-            .find(|l| l.starts_with("SigBlk"))
-            .expect("child must report its blocked-signal mask")
-            .to_string();
+        // A child forked with reset_signal_mask() (the pattern used by the
+        // finish script and readiness probes) must see an empty blocked set.
+        let reset_block_line = child_reports_mask_after_reset(true);
+
+        // Control: without the reset the blocks set above must leak into a
+        // forked child. This proves the test distinguishes a real fix from a
+        // false pass.
+        let leak_block_line = child_reports_mask_after_reset(false);
+
+        // Leave the process with a clean manifest so sibling tests are not
+        // affected later.
         reset_signal_mask();
 
         // SigBlk bitmask is all-zero when no signal is blocked.
         assert!(
-            block_line.ends_with("0000000000000000"),
+            reset_block_line.ends_with("0000000000000000"),
             "reset child must inherit an empty signal mask, got: {}",
-            block_line
+            reset_block_line
         );
-    }
-
-    #[test]
-    fn blocked_signals_are_inherited_without_a_reset() {
-        // Control for `spawned_children_get_a_clean_signal_mask`: without the
-        // pre-exec reset, the SIGCHLD/SIGTERM/SIGINT/SIGHUP blocks set above
-        // must leak into the child. This proves the test distinguishes a real
-        // fix from a false pass.
-        let mut sigset: libc::sigset_t = unsafe { std::mem::zeroed() };
-        unsafe {
-            libc::sigemptyset(&mut sigset);
-            libc::sigaddset(&mut sigset, libc::SIGCHLD);
-            libc::sigaddset(&mut sigset, libc::SIGTERM);
-            libc::sigaddset(&mut sigset, libc::SIGINT);
-            libc::sigaddset(&mut sigset, libc::SIGHUP);
-            libc::sigprocmask(libc::SIG_BLOCK, &sigset, std::ptr::null_mut());
-        }
-        let out = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg("grep '^SigBlk' /proc/self/status")
-            .stdout(std::process::Stdio::piped())
-            .output()
-            .unwrap();
-        let block_line = String::from_utf8(out.stdout)
-            .unwrap()
-            .lines()
-            .find(|l| l.starts_with("SigBlk"))
-            .unwrap()
-            .to_string();
-        reset_signal_mask();
         assert!(
-            !block_line.ends_with("0000000000000000"),
+            !leak_block_line.ends_with("0000000000000000"),
             "without a reset the blocked mask must leak into children, got: {}",
-            block_line
+            leak_block_line
         );
     }
 }
