@@ -340,7 +340,8 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
 
     fn examples_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples")
@@ -384,6 +385,63 @@ mod tests {
             toml::from_str::<TargetConfig>(&content)
                 .unwrap_or_else(|e| panic!("{} must parse as TargetConfig: {}", path.display(), e));
         }
+    }
+
+    /// Every service name referenced by an example target (`requires`) or by a
+    /// service's `[[dependencies]]` must resolve to an actual service file
+    /// under `examples/services/`. This keeps the sample tree self-consistent:
+    /// a dangling reference (e.g. a required service with no definition) would
+    /// otherwise silently fl ag the boot degraded.
+    #[test]
+    fn example_references_resolve() {
+        let base = examples_dir();
+        let service_dir = base.join("services");
+
+        let mut defined: HashSet<String> = HashSet::new();
+        let mut services: Vec<(String, ServiceConfig)> = Vec::new();
+        for path in toml_paths(&service_dir) {
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .expect("service file has a stem")
+                .to_string();
+            let content = std::fs::read_to_string(&path).unwrap();
+            let cfg: ServiceConfig = toml::from_str(&content).unwrap();
+            defined.insert(name.clone());
+            services.push((name, cfg));
+        }
+
+        let mut missing: Vec<String> = Vec::new();
+        for (name, cfg) in &services {
+            for dep in &cfg.dependencies {
+                if !defined.contains(&dep.service) {
+                    missing.push(format!("{} -> {}", name, dep.service));
+                }
+            }
+        }
+
+        for path in toml_paths(&base.join("targets")) {
+            let content = std::fs::read_to_string(&path).unwrap();
+            let target: TargetConfig = toml::from_str(&content).unwrap();
+            for req in &target.target.requires {
+                if !defined.contains(req) {
+                    missing.push(format!("target '{}' -> {}", target_name(&path), req));
+                }
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "example references do not resolve to a service file: {}",
+            missing.join(", ")
+        );
+    }
+
+    fn target_name(path: &Path) -> String {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string()
     }
 
     #[test]

@@ -7,6 +7,7 @@ group = "root"
 
 [service.readiness]
 type = "pid"
+check = "/run/syslog-ng.pid"
 
 [service.restart]
 policy = "always"

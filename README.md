@@ -168,6 +168,14 @@ max_procs     = 256
 max_memory_mb = 512
 cpu_shares    = 512   # cgroup v2 cpu.weight (1 = 2 .. 262144 = 10000)
 
+# Per-stream output routing (default is "log"): where stdout/stderr go.
+#   log     -> into the configured logger (pipe/file/syslog) [default]
+#   null    -> /dev/null
+#   stdout  -> inherit the parent's stdout (stderr only)
+#   syslog  -> through the configured logger (same as log for pipe/file)
+stdout = "log"
+stderr = "log"
+
 [logging]
 type        = "pipe"   # pipe | file | syslog | none
 path        = "/var/log/vigil/sshd"   # optional; defaults log dir
@@ -196,6 +204,15 @@ Readiness semantics:
 | `exec`   | `/bin/sh -c check` exits 0 within the per-run cap |
 
 Socket activation follows the systemd convention: the supervisor binds every `[socket]` listen spec before exec, remaps the descriptors to `3..n` in the child, and exports `LISTEN_FDS` and `LISTEN_PID`. It also sets `VIGIL_SUPERVISOR_PID` to the supervisor's PID so a service can signal/report back to its manager. Hosts in listen specs must be IP literals — name resolution is deliberately avoided at boot.
+
+### Per-service hooks (`/etc/vigil/services/<name>/finish`)
+
+An optional executable at `<service config dir>/<name>/finish` (e.g.
+`/etc/vigil/services/ntpd/finish`) is run by the supervisor whenever the service
+process exits, before the restart decision is taken. It is invoked with the
+service name as its first argument and the `SERVICE_NAME`, `CONFIG_PATH`,
+`LOG_DIR`, and `RESTART_COUNT` environment variables set. This is a convenient
+place to run cleanup or notification logic on service exit.
 
 ### Targets (`/etc/vigil/targets/<target>.toml`)
 

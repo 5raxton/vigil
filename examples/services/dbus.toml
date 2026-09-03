@@ -1,0 +1,33 @@
+[service]
+description = "D-Bus system message bus"
+command = "/usr/bin/dbus-daemon"
+args = ["--system", "--nofork"]
+user = "root"
+group = "root"
+working_dir = "/"
+
+[service.readiness]
+type = "none"
+
+[service.restart]
+policy = "on-failure"
+max_restarts = 5
+backoff_initial_ms = 1000
+backoff_max_ms = 30000
+backoff_multiplier = 2.0
+
+[service.shutdown]
+signal = "TERM"
+timeout_ms = 5000
+kill_signal = "KILL"
+
+[logging]
+type = "pipe"
+max_size_mb = 10
+max_files = 5
+timestamp = true
+
+[[dependencies]]
+service = "network"
+type = "after"
+required = false
